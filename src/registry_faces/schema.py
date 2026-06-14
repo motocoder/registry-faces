@@ -13,10 +13,15 @@ fields later without re-fetching.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+def _new_guid() -> str:
+    return str(uuid.uuid4())
 
 AddressType = Literal["home", "work", "school", "temporary", "other"]
 Sex = Literal["M", "F", "X", "unknown"]
@@ -48,6 +53,10 @@ class Offense(BaseModel):
 
 
 class Identity(BaseModel):
+    # Stable per-person UUID. Generated when an Identity is first created and
+    # preserved across re-ingests by `_merge_identity`. Not derived from any
+    # source field, so it survives renames and source_id changes.
+    guid: str = Field(default_factory=_new_guid)
     full_name: str
     aliases: list[str] = Field(default_factory=list)
     dob: datetime | None = None

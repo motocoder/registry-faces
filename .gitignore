@@ -25,5 +25,10 @@ venv/
 # OS junk
 .DS_Store
 
-# Local data (large, personal, regenerable)
+# Local data (large, personal, regenerable). Output of scrapers /
+# packagers — registry/ is the per-state record tree, registry-runs/
+# the scratch dir from one ingest pass, shards/ the packaged uploads.
+# All three are derivable; nothing here belongs in version control.
 /registry/
+/registry-runs/
+/shards/

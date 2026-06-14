@@ -64,6 +64,7 @@ written — adapters don't need to set it.
 
 | Field            | Type     | Notes |
 |------------------|----------|-------|
+| `guid`           | str      | UUID4. Auto-generated on first ingest and **preserved across re-ingests** — never overwritten. Use this for stable cross-system references; the `(jurisdiction, source_id)` pair remains the on-disk primary key. |
 | `full_name`      | str      | The only required identity field. |
 | `aliases`        | list[str]| Empty if none. Merged as a case-insensitive set across re-ingests. |
 | `dob`            | datetime?| Full date of birth if available. |
@@ -153,6 +154,7 @@ The original source payload (dict). Always populate this. Two reasons:
     "fetched_at": "2026-05-20T16:32:00Z"
   },
   "identity": {
+    "guid": "8f7d0f8e-1f0a-4b6c-9e2d-7a3a1b5e6c10",
     "full_name": "John Q Public",
     "aliases": ["Johnny Public"],
     "year_of_birth": 1975,

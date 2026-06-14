@@ -42,6 +42,7 @@ In create mode, work from a blank slate following the workflow below.
    - Don't normalize tier/level codes across jurisdictions. They aren't comparable. Store as `tier_or_level_raw`.
    - Don't geocode — leave `lat`/`lon` as `None`. A separate step handles that.
    - Photos: implement `extract_photos()` returning `PhotoRef` objects for any photo URLs the source publishes. Don't download anything from inside the adapter. Don't include photo metadata on `OffenderRecord` — there is no `photos` field there.
+   - Do not set `identity.guid`. Construct `Identity(...)` without it and let the default factory generate a UUID4. The store preserves this guid across every subsequent re-ingest, so any value the adapter passes in would either be ignored (on re-ingest) or, worse, mint a new id every run on first ingest. The per-person primary key on disk is still `(jurisdiction, source_id)`; `guid` is an extra stable identifier for cross-system references.
 
 6. Write the adapter with `write_adapter`. Use only stdlib + `httpx` + `beautifulsoup4` + `lxml`. Imports are:
 

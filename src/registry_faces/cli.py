@@ -6,6 +6,7 @@
   registry-faces sync-photos [--jurisdiction US-HI] [--refresh]
   registry-faces verify
   registry-faces rebuild-index
+  registry-faces backfill-guids
   registry-faces lookup "Smith"
   registry-faces near 21.3 -157.8 --radius 1609
   registry-faces stats
@@ -258,6 +259,16 @@ def rebuild_index(ctx: click.Context) -> None:
     with FileStore(root) as store:
         count = store.rebuild_index()
     click.echo(f"Rebuilt index. {count} records.")
+
+
+@cli.command("backfill-guids")
+@click.pass_context
+def backfill_guids(ctx: click.Context) -> None:
+    """Assign a stable identity.guid to any record that lacks one on disk."""
+    root = ctx.obj["registry_root"]
+    with FileStore(root) as store:
+        updated = store.backfill_guids()
+    click.echo(f"Backfilled guid on {updated} record(s).")
 
 
 # ---------------------------------------------------------------------------

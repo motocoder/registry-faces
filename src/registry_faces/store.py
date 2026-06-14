@@ -111,10 +111,15 @@ def _merge_aliases(old: list[str], new: list[str]) -> list[str]:
 
 
 def _merge_identity(old: Identity, new: Identity) -> Identity:
-    """Scalar fields: incoming wins if non-null. Aliases: union."""
+    """Scalar fields: incoming wins if non-null. Aliases: union.
+
+    `guid` is the one exception — it's a stable per-person identifier, so the
+    existing value always wins. The incoming `Identity` always carries a fresh
+    auto-generated guid that would clobber the persisted one otherwise.
+    """
     merged_data = old.model_dump()
     for field, value in new.model_dump().items():
-        if field == "aliases":
+        if field in ("aliases", "guid"):
             continue
         if value not in (None, "", "unknown"):
             merged_data[field] = value
@@ -163,6 +168,7 @@ def _build_index_entry(record: OffenderRecord, person_dir_rel: str) -> dict:
     return {
         "jurisdiction": record.source.jurisdiction,
         "source_id": record.source.source_id,
+        "guid": record.identity.guid,
         "full_name": record.identity.full_name,
         "addresses": addrs,
         "path": person_dir_rel,
@@ -264,6 +270,12 @@ class FileStore:
             return None
         return OffenderRecord.model_validate_json(path.read_text())
 
+    def get_by_guid(self, guid: str) -> OffenderRecord | None:
+        for entry in self._index.values():
+            if entry.get("guid") == guid:
+                return self.get(entry["jurisdiction"], entry["source_id"])
+        return None
+
     def count(self) -> int:
         return len(self._index)
 
@@ -346,6 +358,40 @@ class FileStore:
         (self.indexes_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n"
         )
+
+    def backfill_guids(self) -> int:
+        """Walk records/ and persist a stable guid on any record missing one.
+
+        Records written before guid existed have no `identity.guid` on disk;
+        pydantic auto-generates a fresh one each time they're loaded, which is
+        not stable. This pass reads the raw JSON, generates a guid where the
+        field is absent, writes it back, and refreshes the in-memory index.
+
+        Returns the number of records that were updated.
+        """
+        updated = 0
+        for jur_dir in sorted(self.records_dir.iterdir()):
+            if not jur_dir.is_dir():
+                continue
+            for person_dir in sorted(jur_dir.iterdir()):
+                if not person_dir.is_dir():
+                    continue
+                rec_path = person_dir / "record.json"
+                if not rec_path.exists():
+                    continue
+                raw = json.loads(rec_path.read_text())
+                identity = raw.get("identity") or {}
+                if identity.get("guid"):
+                    continue
+                rec = OffenderRecord.model_validate(raw)  # auto-fills guid
+                rec_path.write_text(rec.model_dump_json(indent=2) + "\n")
+                rel = str(person_dir.relative_to(self.root))
+                self._index[(rec.source.jurisdiction, rec.source.source_id)] = (
+                    _build_index_entry(rec, rel)
+                )
+                self._index_dirty = True
+                updated += 1
+        return updated
 
     def rebuild_index(self) -> int:
         """Walk records/ and regenerate the in-memory index. Returns record count."""
