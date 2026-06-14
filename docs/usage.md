@@ -283,7 +283,6 @@ vars override preset defaults.
 
 - **Republish data.** It's a personal index. State registry ToS generally
   prohibit secondary databases — this is for your own lookups only.
-- **Facial recognition.** Out of scope; refused by design.
 - **Pull photos from outside the source registry.** `sync-photos` only ever
   downloads URLs that the source itself published in its payload. No image
   search, no news scrape, no social media.
