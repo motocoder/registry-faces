@@ -37,7 +37,7 @@ def test_map_and_ingest_file_mode(tmp_path: Path):
         uuid = next(iter(b.store.iter_person_uuids()))
         bundle = b.service.get_bundle(uuid)
         att = bundle.attachments[0]
-        assert att.domain == "registry"
+        assert att.kind == "registry" and att.domain == "criminal"  # registry rolls up to criminal
         assert att.registration.status == "active"
         assert att.offenses[0].raw_description == "Demo offense"
         # scalar height -> min==max range on the canonical person
