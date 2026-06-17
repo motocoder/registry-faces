@@ -383,5 +383,27 @@ def ingest_identity(name: str, target: str | None, config_path: str) -> None:
     click.echo(stats.line())
 
 
+@cli.command("sync-identity-photos")
+@click.option("--to", "target", type=click.Choice(["file", "hbase"]), default=None)
+@click.option("--config", "config_path", default="identity.properties", type=click.Path(dir_okay=False), show_default=True)
+@click.option("--refresh", is_flag=True, help="Re-download already-fetched photos.")
+@click.option("--pause", "pause_seconds", default=0.25, type=float, show_default=True)
+def sync_identity_photos(target: str | None, config_path: str, refresh: bool, pause_seconds: float) -> None:
+    """Download photo bytes for the centralized person store into its BlobStore."""
+    from web_scrubber.person.config import build_identity_service, load_config
+
+    photo_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    )
+    cfg = load_config(config_path, mode_override=target)
+    click.echo(f"Identity photo sync -> {cfg.mode}")
+    with build_identity_service(cfg) as bundle:
+        stats = bundle.sync_photos(refresh=refresh, user_agent=photo_ua, pause_seconds=pause_seconds)
+    click.echo(stats.line())
+    for url, err in stats.failed[:10]:
+        click.echo(f"  FAIL {url} -- {err}")
+
+
 if __name__ == "__main__":
     cli()
