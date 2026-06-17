@@ -345,5 +345,43 @@ def stats(ctx: click.Context) -> None:
         click.echo(f"  {'TOTAL':>10}: {store.count():>6}")
 
 
+@cli.command("ingest-identity")
+@click.argument("name")
+@click.option(
+    "--to",
+    "target",
+    type=click.Choice(["file", "hbase"]),
+    default=None,
+    help="Override identity.mode (file = dry-run to local files, hbase = production).",
+)
+@click.option(
+    "--config",
+    "config_path",
+    default="identity.properties",
+    type=click.Path(dir_okay=False),
+    show_default=True,
+    help="Identity backend properties file (connectivity for HBase / dry-run root).",
+)
+def ingest_identity(name: str, target: str | None, config_path: str) -> None:
+    """Run an adapter and feed its records into the centralized person identity.
+
+    Dry-run to local files by default; pass --to hbase (or set identity.mode=hbase
+    in the properties file) to write to HBase once it's set up.
+    """
+    from web_scrubber.person.config import build_identity_service, load_config
+    from web_scrubber.person.ingest import ingest_adapter
+
+    from .identity_map import map_item
+
+    adapter = _load_adapter(name)
+    cfg = load_config(config_path, mode_override=target)
+    click.echo(f"Identity ingest: {name} ({adapter.jurisdiction}) -> {cfg.mode}")
+    with build_identity_service(cfg) as bundle:
+        stats = ingest_adapter(
+            bundle.service, adapter, map_item, on_progress=lambda n: click.echo(f"  ... {n}")
+        )
+    click.echo(stats.line())
+
+
 if __name__ == "__main__":
     cli()
