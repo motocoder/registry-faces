@@ -74,7 +74,7 @@ def _settings_path() -> Path:
     )
     if not loc:
         loc = str(Path.home() / ".registry-faces")
-    return Path(loc) / "settings.json"
+    return Path(loc) / "settings.local.json"
 
 
 def _load_settings() -> dict:

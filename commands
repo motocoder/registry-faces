@@ -1,0 +1,14 @@
+Those failed because the ! prefix runs through bash, which strips the Windows backslashes. Use forward slashes instead — same commands, bash-compatible:
+
+Browsable (no search term)
+
+! .venv/Scripts/python.exe scripts/residential_probe.py "https://gtlinterface.bernco.gov/custodylist/"
+! .venv/Scripts/python.exe scripts/residential_probe.py "https://omsweb.secure-gps.com/jtclientweb/jailtracker/index/MACOMB_CO_MI"
+
+With a search term
+
+! .venv/Scripts/python.exe scripts/residential_probe.py "https://imljail.shelbycountytn.gov/IML" smith
+! .venv/Scripts/python.exe scripts/residential_probe.py "https://correctionsrecordssearch.com/dekalbcountyga" smith
+! .venv/Scripts/python.exe scripts/residential_probe.py "https://corrections.dccorr.com/inmate-locator" smith
+! .venv/Scripts/python.exe scripts/residential_probe.py "http://www.eccorrections.org/inmatelookup" smith
+! .venv/Scripts/python.exe scripts/residential_probe.py "https://www.hcnj.us/corrections/" smith

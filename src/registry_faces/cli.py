@@ -371,8 +371,35 @@ def stats(ctx: click.Context) -> None:
         click.echo(f"  {'TOTAL':>10}: {store.count():>6}")
 
 
+class _StoreBackedAdapter:
+    """Replays already-ingested local records as adapter items for --from-store.
+
+    Yields the ``(OffenderRecord, [PhotoRef])`` shape ``map_item`` expects, so the
+    whole local corpus can be pushed into the identity service without re-fetching
+    every live source. Photo refs come from each record's saved manifest.
+    """
+
+    def __init__(self, store: "FileStore") -> None:
+        self._store = store
+
+    def run(self):
+        from web_scrubber.photos import read_manifest
+
+        for rec in self._store.filter():
+            person_dir = self._store.person_dir(rec.source.jurisdiction, rec.source.source_id)
+            manifest = read_manifest(person_dir)
+            yield rec, (manifest.photos if manifest else [])
+
+
 @cli.command("ingest-identity")
-@click.argument("name")
+@click.argument("name", required=False)
+@click.option(
+    "--from-store",
+    "from_store",
+    is_flag=True,
+    help="Replay ALL already-ingested local records into identity (no re-fetch) "
+    "instead of running one live adapter.",
+)
 @click.option(
     "--to",
     "target",
@@ -388,25 +415,98 @@ def stats(ctx: click.Context) -> None:
     show_default=True,
     help="Identity backend properties file (connectivity for HBase / dry-run root).",
 )
-def ingest_identity(name: str, target: str | None, config_path: str) -> None:
-    """Run an adapter and feed its records into the centralized person identity.
+@click.option(
+    "--bulk",
+    is_flag=True,
+    help="Fast path for big states: GATHER all records first (network, no lock — "
+    "run many states in parallel), THEN briefly take the global lock and bulk-"
+    "upload. Lock is held only for the upload, not the fetch.",
+)
+@click.option(
+    "--force-unlock",
+    "force_unlock",
+    is_flag=True,
+    help="Clear a stale ingest lock left by a crashed run, then proceed. Use only "
+    "when you are certain no other run for the same lock is active.",
+)
+@click.pass_context
+def ingest_identity(
+    ctx: click.Context, name: str | None, from_store: bool, target: str | None,
+    config_path: str, bulk: bool, force_unlock: bool,
+) -> None:
+    """Run an adapter (or replay the local store) into the centralized person identity.
 
-    Dry-run to local files by default; pass --to hbase (or set identity.mode=hbase
-    in the properties file) to write to HBase once it's set up.
+    Either run one live adapter (``ingest-identity texas``) or replay everything
+    already on disk (``ingest-identity --from-store``). Dry-run to local files by
+    default; pass --to hbase (or set identity.mode=hbase) for production.
+
+    HBase strategies:
+
+    \b
+    * default, single state — PER-STATE lock (``registry:<jurisdiction>``) held
+      for the whole run; several states run fully in parallel.
+    * --bulk (or --from-store) — gather records first with NO lock, then take the
+      GLOBAL lock just long enough to bulk-upload. Best for large states / the
+      whole corpus; uploads serialize, fetches don't.
     """
     from web_scrubber.person.config import build_identity_service, load_config
-    from web_scrubber.person.ingest import ingest_adapter
+    from web_scrubber.person.hbase import IngestLockError, prepare_ingest
+    from web_scrubber.person.ingest import ingest_adapter, ingest_items
 
     from .identity_map import map_item
 
-    adapter = _load_adapter(name)
+    if from_store == bool(name):
+        raise click.ClickException("Pass either an adapter NAME or --from-store (exactly one).")
+
     cfg = load_config(config_path, mode_override=target)
-    click.echo(f"Identity ingest: {name} ({adapter.jurisdiction}) -> {cfg.mode}")
-    with build_identity_service(cfg) as bundle:
-        stats = ingest_adapter(
-            bundle.service, adapter, map_item, on_progress=lambda n: click.echo(f"  ... {n}")
-        )
-    click.echo(stats.line())
+    store = None
+    if from_store:
+        store = FileStore(ctx.obj["registry_root"])
+        adapter: object = _StoreBackedAdapter(store)
+        label, lock_key, lock_owner = "ALL local records", "identity", "registry-faces:from-store"
+    else:
+        adapter = _load_adapter(name)
+        label = f"{name} ({adapter.jurisdiction})"
+        # --bulk spans the upload under the global lock; otherwise per-state lock.
+        lock_key = "identity" if bulk else f"registry:{adapter.jurisdiction}"
+        lock_owner = f"registry-faces:{name}"
+
+    try:
+        if bulk and cfg.mode == "hbase":
+            # Phase 1: gather + map every record with NO lock held (parallel-safe).
+            click.echo(f"Identity ingest [bulk]: {label} -> hbase")
+            click.echo("  phase 1/2: gathering records (no lock held)...")
+            triples = []
+            for item in adapter.run():
+                person, att, ph = map_item(item)
+                # serialize the new-person payload here, off the lock
+                triples.append((person, att, ph, prepare_ingest(person, att)))
+                if len(triples) % 1000 == 0:
+                    click.echo(f"    gathered {len(triples)}")
+            click.echo(f"  gathered {len(triples)} records")
+            # Phase 2: take the GLOBAL lock (bulk store needs sole writer) + upload.
+            click.echo("  phase 2/2: acquiring global lock + bulk upload...")
+            with build_identity_service(
+                cfg, bulk=True, force_unlock=force_unlock,
+                lock_owner=f"{lock_owner}:bulk", lock_key="identity",
+            ) as bundle:
+                stats = ingest_items(
+                    bundle.service, triples, on_progress=lambda n: click.echo(f"    ... {n}")
+                )
+        else:
+            click.echo(f"Identity ingest: {label} -> {cfg.mode} [lock={lock_key}]")
+            with build_identity_service(
+                cfg, force_unlock=force_unlock, lock_owner=lock_owner, lock_key=lock_key
+            ) as bundle:
+                stats = ingest_adapter(
+                    bundle.service, adapter, map_item, on_progress=lambda n: click.echo(f"  ... {n}")
+                )
+        click.echo(stats.line())
+    except IngestLockError as e:
+        raise click.ClickException(str(e)) from e
+    finally:
+        if store is not None:
+            store.close()
 
 
 @cli.command("sync-identity-photos")
@@ -424,7 +524,7 @@ def sync_identity_photos(target: str | None, config_path: str, refresh: bool, pa
     )
     cfg = load_config(config_path, mode_override=target)
     click.echo(f"Identity photo sync -> {cfg.mode}")
-    with build_identity_service(cfg) as bundle:
+    with build_identity_service(cfg, lock_owner="registry-faces", lock_key="photo:registry-faces") as bundle:
         stats = bundle.sync_photos(refresh=refresh, user_agent=photo_ua, pause_seconds=pause_seconds)
     click.echo(stats.line())
     for url, err in stats.failed[:10]:

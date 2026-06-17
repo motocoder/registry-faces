@@ -63,6 +63,14 @@ logger = logging.getLogger("package_shards")
 PHOTO_SKIP_NAMES = {"manifest.json", ".DS_Store", "Thumbs.db"}
 
 
+# Jurisdictions we never build shards for, regardless of what's on disk or
+# what --state requests. These states prohibit redistribution of registry
+# data, so their records must never leave the local store as shards. Sourced
+# from the package-wide single source of truth so ingest, build, and upload
+# can't drift apart.
+from registry_faces.blacklist import BLACKLIST as SHARD_BLACKLIST
+
+
 # ---------- types --------------------------------------------------------
 
 
@@ -563,6 +571,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     if not states:
         parser.error(f"no US-* state dirs under {args.records_dir}")
+
+    # Hard blacklist: drop these jurisdictions even when explicitly passed
+    # via --state, so there's no way to package them by mistake.
+    dropped = [s for s in states if s in SHARD_BLACKLIST]
+    for s in dropped:
+        logger.warning(
+            "[%s] %s is blacklisted — refusing to build shards for it",
+            s, SHARD_BLACKLIST[s],
+        )
+    states = [s for s in states if s not in SHARD_BLACKLIST]
+    if not states:
+        parser.error(
+            "no buildable states left after applying the blacklist "
+            f"({', '.join(sorted(SHARD_BLACKLIST))})"
+        )
 
     args.shards_dir.mkdir(parents=True, exist_ok=True)
     shard_size_bytes = args.shard_size_mb * 1024 * 1024

@@ -113,7 +113,7 @@ registry-faces/
 │   ├── schema.py              ← Pydantic OffenderRecord
 │   ├── store.py               ← FileStore (per-person folders, merge logic)
 │   ├── photos.py              ← PhotoRef / PhotoManifest / sync_photos
-│   ├── adapters/              ← in-package adapters (south_dakota, hawaii)
+│   ├── adapters/              ← 30 in-package state adapters (hawaii = reference)
 │   ├── agent/                 ← provider abstraction + agent builder
 │   └── desktop/               ← PySide6 UI (three tabs + workers)
 ├── adapters_generated/        ← agent-produced adapters land here
