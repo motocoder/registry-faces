@@ -32,6 +32,16 @@ from .store import FileStore
 
 ADAPTERS_OUT = Path("adapters_generated")
 
+# Canary fields for ingest health: if a registry's format changes, one of these
+# usually stops parsing and its coverage collapses (or the run yields 0 records
+# / raises). ``r`` is the OffenderRecord, ``ph`` its photos.
+REGISTRY_FIELD_CHECKS = [
+    ("name", lambda r, ph: bool(r.identity.full_name)),
+    ("offenses", lambda r, ph: len(r.offenses) > 0),
+    ("sex", lambda r, ph: r.identity.sex != "unknown"),
+    ("photo", lambda r, ph: len(ph) > 0),
+]
+
 
 def _load_adapter(name: str) -> Adapter:
     # First try in-package adapters (registry_faces.adapters.<name>)
@@ -183,17 +193,33 @@ def build(
 @click.argument("name")
 @click.pass_context
 def ingest(ctx: click.Context, name: str) -> None:
-    """Run an adapter and merge its records into the store. Idempotent."""
+    """Run an adapter, merge its records into the store, and health-check the run.
+
+    Compares the run against the adapter's last-good baseline (record count +
+    field coverage of name/offenses/sex/photo) and exits non-zero on a likely
+    format break — 0 records, a severe count drop, a run-level exception, or a
+    normally-present field whose parsing collapsed. See also `health`.
+    """
+    from web_scrubber.health import ingest_with_health
+
     adapter = _load_adapter(name)
     root = ctx.obj["registry_root"]
+    health_path = Path(root) / "indexes" / "health.json"
     with FileStore(root) as store:
-        count = 0
-        for record, photo_refs in adapter.run():
-            store.upsert(record, photos=photo_refs)
-            count += 1
-            if count % 100 == 0:
-                click.echo(f"  ingested {count} ...")
-    click.echo(f"Done. Processed {count} records. Total in store: {len(FileStore(root)._index)}.")
+        result = ingest_with_health(
+            adapter,
+            store,
+            adapter_name=name,
+            jurisdiction=getattr(adapter, "jurisdiction", ""),
+            field_checks=REGISTRY_FIELD_CHECKS,
+            health_path=health_path,
+            on_progress=lambda n: click.echo(f"  ... {n}"),
+        )
+    click.echo(result.report())
+    if result.failed:
+        raise click.ClickException(
+            f"ingest health check FAILED for {name} — likely a source format change."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +429,39 @@ def sync_identity_photos(target: str | None, config_path: str, refresh: bool, pa
     click.echo(stats.line())
     for url, err in stats.failed[:10]:
         click.echo(f"  FAIL {url} -- {err}")
+
+
+@cli.command()
+@click.pass_context
+def health(ctx: click.Context) -> None:
+    """Show each adapter's last-run ingest health from indexes/health.json.
+
+    Exits non-zero if any adapter is FAILING, so a cron/monitor can alert on a
+    registry whose format changed without re-running the scrape.
+    """
+    from web_scrubber.health import load_health
+
+    root = ctx.obj["registry_root"]
+    data = load_health(Path(root) / "indexes" / "health.json")
+    if not data:
+        click.echo("(no health data yet — run `ingest <adapter>` first)")
+        return
+    failing = 0
+    for name in sorted(data):
+        last = data[name].get("last", {})
+        status = last.get("status", "?")
+        mark = {"ok": "OK", "warn": "WARN", "fail": "FAIL"}.get(status, status)
+        base = (data[name].get("baseline") or {}).get("records")
+        extra = (f" (baseline {base})" if base is not None else "") + (
+            f", {last['errors']} errors" if last.get("errors") else ""
+        )
+        click.echo(f"[{mark}] {name}: {last.get('records', '?')} records{extra}")
+        for note in last.get("notes", []):
+            click.echo(f"      - {note}")
+        if status == "fail":
+            failing += 1
+    if failing:
+        raise click.ClickException(f"{failing} adapter(s) FAILING — investigate (likely format changes)")
 
 
 if __name__ == "__main__":
