@@ -1,56 +1,28 @@
-"""Filesystem-backed store.
+"""Filesystem store — registry-faces binding over ``web_scrubber.store``.
 
-Layout:
+The generic ``FileStore`` (index, paths, manifest, merge engine) lives in the
+framework. This module keeps the **domain** part: how two ``OffenderRecord``
+records merge, the ``StoreSpec`` wiring, and the registry-specific read methods
+(geo search by zip/radius, and the legacy ``backfill_guids`` migration).
 
-    <registry root>/
-    ├── records/
-    │   ├── US-HI/
-    │   │   ├── 12345/
-    │   │   │   ├── record.json
-    │   │   │   └── photos/
-    │   │   │       ├── manifest.json
-    │   │   │       ├── 001-registry.jpg
-    │   │   │       └── ...
-    │   ├── US-FL/
-    │   │   └── ...
-    ├── indexes/
-    │   ├── index.jsonl       one line per record, used for search
-    │   └── manifest.json     per-jurisdiction counts + last-ingest timestamps
-
-Idempotent merge: re-ingesting the same source merges new data into existing
-records. Null values never overwrite non-null values. Lists union by natural
-key. People who disappear from the source feed keep their folder.
-
-The in-memory index is loaded on open and flushed on close. Use as a context
-manager (`with FileStore(root) as s:`) to ensure flush happens.
+Layout on disk is unchanged: ``records/<jurisdiction>/<source_id>/``.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import re
-from collections.abc import Iterable
-from datetime import datetime, timezone
 from pathlib import Path
 
-from .photos import PhotoRef, merge_photo_refs
-from .schema import Address, Identity, Offense, OffenderRecord, Registration, Source
+from web_scrubber import merge as _merge
+from web_scrubber.store import FileStore as _BaseStore
+from web_scrubber.store import StoreSpec
+
+from .schema import Address, Identity, Offense, OffenderRecord, Source
 
 
 # ---------------------------------------------------------------------------
-# Filename safety
-
-
-_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
-
-
-def _sanitize(name: str) -> str:
-    return _SAFE_RE.sub("_", name) or "_"
-
-
-# ---------------------------------------------------------------------------
-# Merge primitives
+# Merge key functions (domain-specific)
 
 
 def _addr_key(a: Address) -> tuple:
@@ -77,12 +49,10 @@ def _merge_addresses(old: list[Address], new: list[Address]) -> list[Address]:
         k = _addr_key(a)
         if k in by_key:
             existing = by_key[k]
-            # Refresh verified_at if newer
             if a.verified_at and (
                 existing.verified_at is None or a.verified_at > existing.verified_at
             ):
                 existing.verified_at = a.verified_at
-            # Fill in any missing geo info
             if existing.lat is None and a.lat is not None:
                 existing.lat = a.lat
             if existing.lon is None and a.lon is not None:
@@ -92,38 +62,12 @@ def _merge_addresses(old: list[Address], new: list[Address]) -> list[Address]:
     return list(by_key.values())
 
 
-def _merge_offenses(old: list[Offense], new: list[Offense]) -> list[Offense]:
-    by_key: dict[tuple, Offense] = {_offense_key(o): o for o in old}
-    for o in new:
-        k = _offense_key(o)
-        if k not in by_key:
-            by_key[k] = o
-    return list(by_key.values())
-
-
-def _merge_aliases(old: list[str], new: list[str]) -> list[str]:
-    seen: dict[str, str] = {}  # lowercased -> original
-    for a in old + new:
-        k = a.strip().lower()
-        if k and k not in seen:
-            seen[k] = a.strip()
-    return list(seen.values())
-
-
 def _merge_identity(old: Identity, new: Identity) -> Identity:
-    """Scalar fields: incoming wins if non-null. Aliases: union.
-
-    `guid` is the one exception — it's a stable per-person identifier, so the
-    existing value always wins. The incoming `Identity` always carries a fresh
-    auto-generated guid that would clobber the persisted one otherwise.
-    """
-    merged_data = old.model_dump()
-    for field, value in new.model_dump().items():
-        if field in ("aliases", "guid"):
-            continue
-        if value not in (None, "", "unknown"):
-            merged_data[field] = value
-    merged_data["aliases"] = _merge_aliases(old.aliases, new.aliases)
+    """Scalar fields: incoming wins if non-null. Aliases: union. ``guid`` stable."""
+    merged_data = _merge.merge_scalars(
+        old.model_dump(), new.model_dump(), skip={"aliases", "guid"}
+    )
+    merged_data["aliases"] = _merge.merge_aliases(old.aliases, new.aliases)
     return Identity(**merged_data)
 
 
@@ -139,162 +83,72 @@ def _merge_source(old: Source, new: Source) -> Source:
 
 
 def merge_records(existing: OffenderRecord, incoming: OffenderRecord) -> OffenderRecord:
-    """Apply the merge rules described at the top of this module."""
+    """Idempotent merge: null never overwrites, lists union, registration latest-wins."""
     return OffenderRecord(
         source=_merge_source(existing.source, incoming.source),
         identity=_merge_identity(existing.identity, incoming.identity),
         addresses=_merge_addresses(existing.addresses, incoming.addresses),
-        offenses=_merge_offenses(existing.offenses, incoming.offenses),
-        registration=incoming.registration,  # status latest wins
+        offenses=_merge.union_by_key(existing.offenses, incoming.offenses, _offense_key),
+        registration=incoming.registration,
         raw=incoming.raw if incoming.raw is not None else existing.raw,
     )
 
 
 # ---------------------------------------------------------------------------
-# Index entry
+# StoreSpec wiring
 
 
-def _build_index_entry(record: OffenderRecord, person_dir_rel: str) -> dict:
+def _key_of(rec: OffenderRecord) -> tuple[str, str]:
+    return (rec.source.jurisdiction, rec.source.source_id)
+
+
+def _set_first_seen(rec: OffenderRecord) -> None:
+    if rec.source.first_seen_at is None:
+        rec.source.first_seen_at = rec.source.fetched_at
+
+
+def _index_entry(rec: OffenderRecord, rel: str) -> dict:
     addrs = [
-        {
-            "city": a.city,
-            "state": a.state,
-            "zip": a.zip,
-            "lat": a.lat,
-            "lon": a.lon,
-        }
-        for a in record.addresses
+        {"city": a.city, "state": a.state, "zip": a.zip, "lat": a.lat, "lon": a.lon}
+        for a in rec.addresses
     ]
     return {
-        "jurisdiction": record.source.jurisdiction,
-        "source_id": record.source.source_id,
-        "guid": record.identity.guid,
-        "full_name": record.identity.full_name,
+        "jurisdiction": rec.source.jurisdiction,
+        "source_id": rec.source.source_id,
+        "path": rel,
+        "name": rec.identity.full_name,
+        "full_name": rec.identity.full_name,
+        "guid": rec.identity.guid,
         "addresses": addrs,
-        "path": person_dir_rel,
     }
 
 
-# ---------------------------------------------------------------------------
-# FileStore
+SPEC: StoreSpec = StoreSpec(
+    record_cls=OffenderRecord,
+    key_of=_key_of,
+    merge=merge_records,
+    index_entry_of=_index_entry,
+    on_first_seen=_set_first_seen,
+)
 
 
-class FileStore:
-    def __init__(self, root: str | Path = "registry") -> None:
-        self.root = Path(root)
-        self.records_dir = self.root / "records"
-        self.indexes_dir = self.root / "indexes"
-        self.records_dir.mkdir(parents=True, exist_ok=True)
-        self.indexes_dir.mkdir(parents=True, exist_ok=True)
+class FileStore(_BaseStore):
+    """Source-keyed store bound to the registry-faces schema.
 
-        # In-memory index: (jurisdiction, source_id) -> entry dict
-        self._index: dict[tuple[str, str], dict] = {}
-        self._index_dirty = False
-        self._load_index()
+    Adds the registry-specific geo search and the legacy guid backfill on top
+    of the generic store (name search / get / get_by_guid / stats /
+    rebuild_index are inherited).
+    """
 
-    # ---- context manager ------------------------------------------------
+    def __init__(self, root="registry") -> None:
+        super().__init__(root, SPEC)
 
-    def __enter__(self) -> "FileStore":
-        return self
+    # ---- geo search (domain) -------------------------------------------
 
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-    def close(self) -> None:
-        if self._index_dirty:
-            self._flush_index()
-            self._write_manifest()
-            self._index_dirty = False
-
-    # ---- paths ----------------------------------------------------------
-
-    def person_dir(self, jurisdiction: str, source_id: str) -> Path:
-        return self.records_dir / _sanitize(jurisdiction) / _sanitize(source_id)
-
-    def _person_dir_rel(self, jurisdiction: str, source_id: str) -> str:
-        return str(self.person_dir(jurisdiction, source_id).relative_to(self.root))
-
-    # ---- upsert ---------------------------------------------------------
-
-    def upsert(
-        self,
-        record: OffenderRecord,
-        photos: list[PhotoRef] | None = None,
-    ) -> OffenderRecord:
-        """Merge `record` into the store. Returns the final merged record."""
-        photos = photos or []
-        person_dir = self.person_dir(record.source.jurisdiction, record.source.source_id)
-        person_dir.mkdir(parents=True, exist_ok=True)
-        record_path = person_dir / "record.json"
-
-        if record_path.exists():
-            existing = OffenderRecord.model_validate_json(record_path.read_text())
-            merged = merge_records(existing, record)
-        else:
-            # First sighting — ensure first_seen_at is set
-            if record.source.first_seen_at is None:
-                record.source.first_seen_at = record.source.fetched_at
-            merged = record
-
-        record_path.write_text(merged.model_dump_json(indent=2) + "\n")
-
-        if photos:
-            merge_photo_refs(
-                person_dir,
-                person_key={
-                    "jurisdiction": merged.source.jurisdiction,
-                    "source_id": merged.source.source_id,
-                },
-                refs=photos,
-            )
-
-        # Update in-memory index
-        entry = _build_index_entry(merged, self._person_dir_rel(merged.source.jurisdiction, merged.source.source_id))
-        self._index[(merged.source.jurisdiction, merged.source.source_id)] = entry
-        self._index_dirty = True
-
-        return merged
-
-    def upsert_many(self, records: Iterable[OffenderRecord]) -> int:
-        count = 0
-        for r in records:
-            self.upsert(r)
-            count += 1
-        return count
-
-    # ---- read -----------------------------------------------------------
-
-    def get(self, jurisdiction: str, source_id: str) -> OffenderRecord | None:
-        path = self.person_dir(jurisdiction, source_id) / "record.json"
-        if not path.exists():
-            return None
-        return OffenderRecord.model_validate_json(path.read_text())
-
-    def get_by_guid(self, guid: str) -> OffenderRecord | None:
+    def search_zip(self, zip_code: str) -> list:
+        out = []
         for entry in self._index.values():
-            if entry.get("guid") == guid:
-                return self.get(entry["jurisdiction"], entry["source_id"])
-        return None
-
-    def count(self) -> int:
-        return len(self._index)
-
-    def search_name(self, query: str, limit: int = 50) -> list[OffenderRecord]:
-        q = query.lower()
-        out: list[OffenderRecord] = []
-        for entry in self._index.values():
-            if q in entry["full_name"].lower():
-                rec = self.get(entry["jurisdiction"], entry["source_id"])
-                if rec is not None:
-                    out.append(rec)
-                if len(out) >= limit:
-                    break
-        return out
-
-    def search_zip(self, zip_code: str) -> list[OffenderRecord]:
-        out: list[OffenderRecord] = []
-        for entry in self._index.values():
-            for addr in entry["addresses"]:
+            for addr in entry.get("addresses", []):
                 if addr.get("zip") == zip_code:
                     rec = self.get(entry["jurisdiction"], entry["source_id"])
                     if rec is not None:
@@ -302,16 +156,16 @@ class FileStore:
                     break
         return out
 
-    def search_radius(self, lat: float, lon: float, radius_meters: float) -> list[OffenderRecord]:
+    def search_radius(self, lat: float, lon: float, radius_meters: float) -> list:
         lat_delta = radius_meters / 111_111
         cos_lat = max(0.0001, abs(math.cos(math.radians(lat))))
         lon_delta = radius_meters / (111_111 * cos_lat)
         lat_lo, lat_hi = lat - lat_delta, lat + lat_delta
         lon_lo, lon_hi = lon - lon_delta, lon + lon_delta
 
-        out: list[OffenderRecord] = []
+        out = []
         for entry in self._index.values():
-            for addr in entry["addresses"]:
+            for addr in entry.get("addresses", []):
                 a_lat, a_lon = addr.get("lat"), addr.get("lon")
                 if a_lat is None or a_lon is None:
                     continue
@@ -322,52 +176,13 @@ class FileStore:
                     break
         return out
 
-    def stats(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for entry in self._index.values():
-            counts[entry["jurisdiction"]] = counts.get(entry["jurisdiction"], 0) + 1
-        return counts
-
-    # ---- index ----------------------------------------------------------
-
-    def _load_index(self) -> None:
-        path = self.indexes_dir / "index.jsonl"
-        if not path.exists():
-            return
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                entry = json.loads(line)
-                self._index[(entry["jurisdiction"], entry["source_id"])] = entry
-
-    def _flush_index(self) -> None:
-        path = self.indexes_dir / "index.jsonl"
-        sorted_keys = sorted(self._index.keys())
-        with path.open("w") as f:
-            for key in sorted_keys:
-                f.write(json.dumps(self._index[key], separators=(",", ":")) + "\n")
-
-    def _write_manifest(self) -> None:
-        manifest = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "total_records": self.count(),
-            "by_jurisdiction": self.stats(),
-        }
-        (self.indexes_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2) + "\n"
-        )
+    # ---- legacy guid backfill (domain migration) -----------------------
 
     def backfill_guids(self) -> int:
-        """Walk records/ and persist a stable guid on any record missing one.
+        """Persist a stable guid on any record written before guid existed.
 
-        Records written before guid existed have no `identity.guid` on disk;
-        pydantic auto-generates a fresh one each time they're loaded, which is
-        not stable. This pass reads the raw JSON, generates a guid where the
-        field is absent, writes it back, and refreshes the in-memory index.
-
-        Returns the number of records that were updated.
+        Reads the raw JSON, generates a guid where the field is absent, writes
+        it back, and refreshes the in-memory index. Returns the count updated.
         """
         updated = 0
         for jur_dir in sorted(self.records_dir.iterdir()):
@@ -379,39 +194,17 @@ class FileStore:
                 rec_path = person_dir / "record.json"
                 if not rec_path.exists():
                     continue
-                raw = json.loads(rec_path.read_text())
+                raw = json.loads(rec_path.read_text(encoding="utf-8"))
                 identity = raw.get("identity") or {}
                 if identity.get("guid"):
                     continue
                 rec = OffenderRecord.model_validate(raw)  # auto-fills guid
-                rec_path.write_text(rec.model_dump_json(indent=2) + "\n")
+                rec_path.write_text(rec.model_dump_json(indent=2) + "\n", encoding="utf-8")
                 rel = str(person_dir.relative_to(self.root))
-                self._index[(rec.source.jurisdiction, rec.source.source_id)] = (
-                    _build_index_entry(rec, rel)
-                )
+                self._index[_key_of(rec)] = _index_entry(rec, rel)
                 self._index_dirty = True
                 updated += 1
         return updated
-
-    def rebuild_index(self) -> int:
-        """Walk records/ and regenerate the in-memory index. Returns record count."""
-        self._index.clear()
-        for jur_dir in sorted(self.records_dir.iterdir()):
-            if not jur_dir.is_dir():
-                continue
-            for person_dir in sorted(jur_dir.iterdir()):
-                if not person_dir.is_dir():
-                    continue
-                rec_path = person_dir / "record.json"
-                if not rec_path.exists():
-                    continue
-                rec = OffenderRecord.model_validate_json(rec_path.read_text())
-                rel = str(person_dir.relative_to(self.root))
-                self._index[(rec.source.jurisdiction, rec.source.source_id)] = (
-                    _build_index_entry(rec, rel)
-                )
-        self._index_dirty = True
-        return len(self._index)
 
 
 # Backwards-compat alias
