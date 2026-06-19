@@ -471,6 +471,21 @@ def ingest_identity(
         lock_key = "identity" if bulk else f"registry:{adapter.jurisdiction}"
         lock_owner = f"registry-faces:{name}"
 
+    # One rebuildable bundle so the ingest loop can reconnect after a dropped
+    # connection (a long scrape can idle the gateway past its read timeout).
+    _holder: dict = {}
+
+    def _open(**bk):
+        _holder["b"] = build_identity_service(cfg, **bk)
+        return _holder["b"].service
+
+    def _reopen(**bk):
+        try:
+            _holder["b"].close()
+        except Exception:  # noqa: BLE001
+            pass
+        return _open(**{**bk, "force_unlock": True})
+
     try:
         if bulk and cfg.mode == "hbase":
             # Phase 1: gather + map every record with NO lock held (parallel-safe).
@@ -486,25 +501,28 @@ def ingest_identity(
             click.echo(f"  gathered {len(triples)} records")
             # Phase 2: take the GLOBAL lock (bulk store needs sole writer) + upload.
             click.echo("  phase 2/2: acquiring global lock + bulk upload...")
-            with build_identity_service(
-                cfg, bulk=True, force_unlock=force_unlock,
-                lock_owner=f"{lock_owner}:bulk", lock_key="identity",
-            ) as bundle:
-                stats = ingest_items(
-                    bundle.service, triples, on_progress=lambda n: click.echo(f"    ... {n}")
-                )
+            bk = dict(bulk=True, force_unlock=force_unlock,
+                      lock_owner=f"{lock_owner}:bulk", lock_key="identity")
+            stats = ingest_items(
+                _open(**bk), triples, reopen=lambda: _reopen(**bk),
+                on_progress=lambda n: click.echo(f"    ... {n}"),
+            )
         else:
             click.echo(f"Identity ingest: {label} -> {cfg.mode} [lock={lock_key}]")
-            with build_identity_service(
-                cfg, force_unlock=force_unlock, lock_owner=lock_owner, lock_key=lock_key
-            ) as bundle:
-                stats = ingest_adapter(
-                    bundle.service, adapter, map_item, on_progress=lambda n: click.echo(f"  ... {n}")
-                )
+            bk = dict(force_unlock=force_unlock, lock_owner=lock_owner, lock_key=lock_key)
+            stats = ingest_adapter(
+                _open(**bk), adapter, map_item, reopen=lambda: _reopen(**bk),
+                on_progress=lambda n: click.echo(f"  ... {n}"),
+            )
         click.echo(stats.line())
     except IngestLockError as e:
         raise click.ClickException(str(e)) from e
     finally:
+        if _holder.get("b") is not None:
+            try:
+                _holder["b"].close()
+            except Exception:  # noqa: BLE001
+                pass
         if store is not None:
             store.close()
 
