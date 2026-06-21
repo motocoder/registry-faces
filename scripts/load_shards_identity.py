@@ -130,8 +130,10 @@ def push_photos(bundle, uuid: str, jur: str, sid: str, photos: list, refresh: bo
         key = hashlib.sha256(data).hexdigest()  # = blob_key (content address)
         if entry and entry.blob_key == key and not refresh:
             continue
+        loc = None
         if not meta_only:  # push the bytes now (non-two-phase path)
-            key = bundle.blobs.put(data)
+            loc = bundle.blobs.put_located(data)  # sha256 + HDFS byte locator
+            key = loc.key
         if entry is None:
             entry = PhotoEntry(
                 url=url, source_jurisdiction=jur, source_id=sid,
@@ -141,6 +143,10 @@ def push_photos(bundle, uuid: str, jur: str, sid: str, photos: list, refresh: bo
             by_url[url] = entry
         entry.blob_key = key
         entry.sha256 = key
+        if loc is not None and loc.container is not None:  # single-phase: record now
+            entry.blob_container = loc.container           # (two-phase fills these later)
+            entry.blob_offset = loc.offset
+            entry.blob_length = loc.length
         entry.content_type = _ctype(filename, data)
         entry.size_bytes = len(data)
         entry.fetched_at = _now()
@@ -179,10 +185,11 @@ def iter_all_photo_bytes(zips: list[Path]):
 
 
 def run_photo_phase(states: list[str], shards_dir: Path, cfg) -> int:
-    """PHASE 2 (lock-free, NO HBase): push every shard photo's bytes into the HDFS
-    blob store. The manifest pointers (blob_key = sha256) were written in phase 1;
-    here we just land the bytes those pointers refer to. Content-addressed, so it
-    dedups within the run and is safe to re-run. Returns photos pushed."""
+    """PHASE 2: push every shard photo's bytes into the HDFS blob store (lock-free),
+    then record each byte's (container, offset, length) onto its manifest in a brief
+    locked pass so registry-server can range-read it via HttpFS. Phase 1 wrote the
+    manifest pointers (blob_key = sha256); the byte push is content-addressed (dedups
+    within the run, safe to re-run). Returns photos pushed."""
     from web_scrubber.person.hdfs_blob import HdfsAvroBlobStore
 
     blobs = HdfsAvroBlobStore(
@@ -209,6 +216,28 @@ def run_photo_phase(states: list[str], shards_dir: Path, cfg) -> int:
         print("waiting for final HDFS pushes ...", flush=True)
         blobs.close()
     print(f"PHOTO PHASE DONE: {total} photos, {mb:.0f} MB to HDFS", flush=True)
+
+    # Phase 1 wrote the manifest pointers before these bytes existed, so the byte
+    # offsets weren't known then. Now that the bytes are in HDFS, record each
+    # photo's (container, offset, length) into its manifest from the locations the
+    # blob store captured — so registry-server can range-read it via HttpFS.
+    locs = blobs.locations()
+    if cfg is not None and locs:
+        from web_scrubber.person.config import build_identity_service
+        from web_scrubber.person.photosync import apply_blob_locations
+        print(f"recording blob offsets into manifests ({len(locs)} images) ...", flush=True)
+        ob = build_identity_service(
+            cfg, force_unlock=True,
+            lock_owner="registry-faces:load-shards:offsets", lock_key="identity",
+        )
+        try:
+            np_, nph_ = apply_blob_locations(
+                ob.store, locs,
+                progress=lambda n: (n % 20000 == 0) and print(f"  offsets: {n} persons", flush=True),
+            )
+            print(f"OFFSETS RECORDED: {nph_} photos across {np_} persons", flush=True)
+        finally:
+            ob.close()
     return total
 
 
