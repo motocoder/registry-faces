@@ -32,5 +32,6 @@ venv/
 /registry/
 /registry-runs/
 /shards/
+/shards_*/
 
 identity-store/

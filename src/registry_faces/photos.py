@@ -30,6 +30,13 @@ class PhotoRef(_PhotoRef):
     source_type: str = "registry"
 
 
+# Hosts whose TLS chains don't validate (server omits the intermediate cert), so
+# httpx's default verify fails with CERTIFICATE_VERIFY_FAILED. Domain knowledge,
+# not a security toggle — these are public state SOR image CDNs we still trust.
+#   vspsor.com — Virginia State Police sex-offender registry image API.
+SSL_INSECURE_HOSTS: frozenset[str] = frozenset({"vspsor.com"})
+
+
 def sync_photos(
     records_root: Path,
     jurisdiction: str | None = None,
@@ -37,6 +44,7 @@ def sync_photos(
     timeout: float = 60.0,
     user_agent: str = "registry-faces/0.1",
     progress_callback=None,
+    ssl_insecure_hosts: frozenset[str] | set[str] | None = SSL_INSECURE_HOSTS,
 ) -> dict:
     """Download pending photos. Same signature as historical registry-faces."""
     return _sync_photos(
@@ -46,4 +54,5 @@ def sync_photos(
         timeout=timeout,
         user_agent=user_agent,
         progress_callback=progress_callback,
+        ssl_insecure_hosts=ssl_insecure_hosts,
     )
