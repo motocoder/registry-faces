@@ -563,8 +563,13 @@ def sync_identity_photos(target: str | None, config_path: str, refresh: bool, pa
 @click.option("--shard", default=None,
               help="Process only a hash-slice 'i/N' of persons, so N processes "
                    "can run in parallel (e.g. --shard 0/20 ... --shard 19/20).")
+@click.option("--headless/--headed", "headless", default=True, show_default=True,
+              help="Run Chromium headless (no on-screen windows). Headless is the "
+                   "right default for bulk state-registry pages; use --headed only "
+                   "for sites whose bot gate defeats headless (rare here).")
 def enrich_details(target: str | None, config_path: str, limit: int | None,
-                   pause_seconds: float, kind: str, shard: str | None) -> None:
+                   pause_seconds: float, kind: str, shard: str | None,
+                   headless: bool) -> None:
     """Backfill physical specs by fetching each person's detail page.
 
     Fills ONLY missing race / eye / hair / height / weight / age fields (the
@@ -590,7 +595,8 @@ def enrich_details(target: str | None, config_path: str, limit: int | None,
                f"kind={kind}, shard={shard or 'all'})")
     # lock=False: an idempotent backfill that only fills gaps — don't contend
     # with an in-progress ingest's single-writer lock.
-    with build_identity_service(cfg, lock=False) as bundle, BrowserFetcher() as fetcher:
+    with build_identity_service(cfg, lock=False) as bundle, \
+            BrowserFetcher(headless=headless) as fetcher:
         def fetch_html(url: str) -> str | None:
             time.sleep(pause_seconds)
             try:
