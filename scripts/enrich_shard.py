@@ -7,6 +7,7 @@ its hash-slice and resumes filling gaps. Loops until a clean exit (code 0).
 
 Usage:  python scripts/enrich_shard.py <index> <N> [pause] [backoff]
 """
+import random
 import subprocess
 import sys
 import time
@@ -36,8 +37,14 @@ def main() -> int:
         if code == 0:
             print(f"=== [shard {index}/{n}] DONE clean (exit 0) after {attempt} attempt(s) {stamp()} ===", flush=True)
             return 0
-        print(f"=== [shard {index}/{n}] exit {code} — restarting in {backoff}s {stamp()} ===", flush=True)
-        time.sleep(backoff)
+        # Jittered backoff: if several shards crash together, a fixed delay would
+        # relaunch them in lockstep and they'd re-scan from row 0 simultaneously,
+        # re-creating the restart storm. Randomizing desynchronizes them. (The
+        # store-level reconnect in put_person should prevent most crashes now; this
+        # is defense-in-depth.)
+        delay = backoff + random.uniform(0, backoff)
+        print(f"=== [shard {index}/{n}] exit {code} — restarting in {delay:.0f}s {stamp()} ===", flush=True)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
