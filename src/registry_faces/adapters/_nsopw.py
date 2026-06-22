@@ -537,6 +537,12 @@ class NsopwAdapter(Adapter):
                 full_name=full_name,
                 aliases=aliases,
                 sex=_normalize_sex(raw.get("gender")),
+                # NSOPW returns current `age` (no DOB). Derive an approximate
+                # birth year from the fetch date so downstream gets an age axis.
+                # race/height/weight/eyes/hair are NOT in the NSOPW API — they
+                # live on the per-offender state detail page and are filled by
+                # the detail-enrichment pass.
+                year_of_birth=_yob_from_age(raw.get("age"), self._fetched_at),
             ),
             addresses=addresses,
             registration=registration,
@@ -574,6 +580,19 @@ def _jur_capped(resp: dict, code: str) -> bool:
         if j.get("jurisdictionId") == code and str(j.get("statusCode")) == "511":
             return True
     return False
+
+
+def _yob_from_age(age: object, fetched_at: datetime | None) -> int | None:
+    """Approximate birth year from NSOPW's current `age` and the fetch date.
+    Returns None for missing / out-of-range ages."""
+    try:
+        a = int(age)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or a > 120:
+        return None
+    year = (fetched_at or datetime.now(timezone.utc)).year
+    return year - a
 
 
 def _normalize_sex(value: object) -> str:

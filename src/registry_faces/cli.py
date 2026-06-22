@@ -549,6 +549,63 @@ def sync_identity_photos(target: str | None, config_path: str, refresh: bool, pa
         click.echo(f"  FAIL {url} -- {err}")
 
 
+@cli.command("enrich-details")
+@click.option("--to", "target", type=click.Choice(["file", "hbase"]), default=None)
+@click.option("--config", "config_path", default="identity.properties",
+              type=click.Path(dir_okay=False), show_default=True)
+@click.option("--limit", type=int, default=None,
+              help="Stop after N persons scanned (for testing a slice).")
+@click.option("--pause", "pause_seconds", default=0.5, type=float, show_default=True,
+              help="Delay between detail-page fetches (politeness/rate-limit).")
+@click.option("--kind", default="registry", show_default=True,
+              help="Only enrich persons with an attachment of this kind "
+                   "(registry/wanted/missing/booking). Scopes the backfill.")
+@click.option("--shard", default=None,
+              help="Process only a hash-slice 'i/N' of persons, so N processes "
+                   "can run in parallel (e.g. --shard 0/20 ... --shard 19/20).")
+def enrich_details(target: str | None, config_path: str, limit: int | None,
+                   pause_seconds: float, kind: str, shard: str | None) -> None:
+    """Backfill physical specs by fetching each person's detail page.
+
+    Fills ONLY missing race / eye / hair / height / weight / age fields (the
+    aggregator APIs omit them — they live on the per-offender detail page), via
+    the shared, deterministic detail extractor. Idempotent and safe to re-run;
+    skips persons that already have the data. Detail URLs come from each
+    person's attachments (info_url / source_url / offenderUri).
+    """
+    import time
+    from datetime import datetime, timezone
+
+    from web_scrubber.fetch.browser import BrowserFetcher
+    from web_scrubber.person.config import build_identity_service, load_config
+    from web_scrubber.person.detail_enrich import run_enrichment
+
+    cfg = load_config(config_path, mode_override=target)
+    year = datetime.now(timezone.utc).year
+    shard_t = None
+    if shard:
+        i, n = (int(x) for x in shard.split("/"))
+        shard_t = (i, n)
+    click.echo(f"Detail enrichment -> {cfg.mode} (reference year {year}, "
+               f"kind={kind}, shard={shard or 'all'})")
+    # lock=False: an idempotent backfill that only fills gaps — don't contend
+    # with an in-progress ingest's single-writer lock.
+    with build_identity_service(cfg, lock=False) as bundle, BrowserFetcher() as fetcher:
+        def fetch_html(url: str) -> str | None:
+            time.sleep(pause_seconds)
+            try:
+                return fetcher.fetch(url)
+            except Exception:  # noqa: BLE001 — a bad page never aborts the run
+                return None
+
+        scanned, enriched = run_enrichment(
+            bundle.store, fetch_html, reference_year=year, limit=limit, kinds=(kind,),
+            shard=shard_t,
+            on_progress=lambda s, e: click.echo(f"  scanned={s} enriched={e}"),
+        )
+    click.echo(f"done: scanned={scanned} enriched={enriched}")
+
+
 @cli.command()
 @click.pass_context
 def health(ctx: click.Context) -> None:
