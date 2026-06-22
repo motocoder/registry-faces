@@ -95,3 +95,30 @@ the new fields.
 - The same `enrich-details` exists on missing-faces/wanted-faces (defaults
   `--kind missing` / `wanted`) but you said registry-only for now — those already
   get most specs from their source APIs anyway.
+
+---
+
+# SEPARATE FIX — map cluster piling (`regeocode-hbase`)
+
+Symptom: a map cluster of tens of thousands that won't break when you zoom (just
+zooms to max and never fans). Cause: registry records that only resolved to a
+**state** were placed on the bare **state centroid**, so they share one identical
+coordinate (e.g. ~66k on the FL centroid, all `geo_precision=state`). The map
+can't separate identical points by zoom, and can't fan that many.
+
+The geocoder now disperses `state`-tier points across the state's bounding box;
+this data just predates it. Re-geocode it once:
+
+```powershell
+cd C:/development/registry-faces && git pull   # gets the new command
+registry-faces regeocode-hbase --dry-run       # preview the precision breakdown
+registry-faces regeocode-hbase                 # disperse registry addrs, writes HBase
+```
+- Scans the `person` table, re-runs the dispersing geocoder over every **registry**
+  attachment (`a:criminal:registry:*`), keeps real `exact` coords, bumps `i:json`
+  so the map delta-sync notices. Takes the global ingest lock; re-run if held.
+- After it finishes, surface it: `POST https://www.registryrecognizer.com/admin/pins/sync?full=true`.
+
+Result: each state's records scatter across the state → clusters break apart as
+you zoom → genuinely same-address handfuls fall under the spiderfy cap and fan
+out normally.

@@ -606,6 +606,83 @@ def enrich_details(target: str | None, config_path: str, limit: int | None,
     click.echo(f"done: scanned={scanned} enriched={enriched}")
 
 
+@cli.command("regeocode-hbase")
+@click.option("--config", "config_path", default="identity.properties",
+              type=click.Path(dir_okay=False), show_default=True)
+@click.option("--dry-run", is_flag=True, help="Report what would change without writing.")
+def regeocode_hbase(config_path: str, dry_run: bool) -> None:
+    """Re-geocode existing REGISTRY attachments in HBase (disperse state/zip).
+
+    Fixes data ingested before dispersing geocoding: tens of thousands of
+    registry records were placed on the bare STATE CENTROID
+    (geo_precision=state), so they stack on one point and the map can't break the
+    cluster by zooming. This re-derives each registry address through the
+    dispersing geocoder (state bbox / zip-city radius / random fallback), keeps
+    genuine source coords (exact), and bumps i:json so the map delta-pull picks
+    it up. Takes the global ingest lock; re-run if held.
+    """
+    import json
+    from collections import Counter
+
+    import happybase
+
+    from web_scrubber.geocode import geocode_address, state_from_jurisdiction
+    from web_scrubber.person.config import load_config
+    from web_scrubber.person.hbase import IngestLock
+
+    cfg = load_config(config_path)
+    conn = happybase.Connection(
+        host=cfg.hbase_host, port=cfg.hbase_port,
+        table_prefix=cfg.hbase_table_prefix or None,
+    )
+    person = conn.table("person")
+    lock = IngestLock(conn, owner="registry-faces:regeocode-hbase").acquire()
+    click.echo(f"lock acquired; scanning person table (dry_run={dry_run}) ...")
+    prec: Counter = Counter()
+    n_person = n_att = n_addr = 0
+    try:
+        for ukey, row in person.scan(columns=[b"a", b"i"], batch_size=500):
+            changed = False
+            for col, val in list(row.items()):
+                c = col.decode()
+                if not c.startswith("a:criminal:registry:"):
+                    continue
+                att = json.loads(val)
+                src = att.get("source", {}) or {}
+                jur, sid = src.get("jurisdiction", ""), src.get("source_id", "")
+                fb = state_from_jurisdiction(jur)
+                att_changed = False
+                for i, a in enumerate(att.get("addresses") or []):
+                    n_addr += 1
+                    if a.get("geo_precision") == "exact" and a.get("lat") is not None:
+                        prec["exact"] += 1
+                        continue
+                    res = geocode_address(
+                        seed=f"{jur}:{sid}:{i}", state=a.get("state"),
+                        city=a.get("city"), country=a.get("country"), fallback_state=fb,
+                    )
+                    a["lat"], a["lon"], a["geo_precision"] = res.lat, res.lon, res.source
+                    prec[res.source] += 1
+                    att_changed = True
+                if att_changed:
+                    n_att += 1
+                    if not dry_run:
+                        person.put(ukey, {col: json.dumps(att).encode("utf-8")})
+                    changed = True
+            if changed:
+                n_person += 1
+                ij = row.get(b"i:json")
+                if ij and not dry_run:
+                    person.put(ukey, {b"i:json": ij})  # bump ts for map delta-pull
+                if n_person % 2000 == 0:
+                    click.echo(f"  ... {n_person} persons")
+    finally:
+        lock.release()
+    click.echo(f"persons updated={n_person} attachments={n_att} addresses={n_addr}")
+    for p, c in prec.most_common():
+        click.echo(f"  {p:10s} {c}")
+
+
 @cli.command()
 @click.pass_context
 def health(ctx: click.Context) -> None:
