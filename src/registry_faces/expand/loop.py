@@ -120,18 +120,37 @@ def _registered() -> list[str]:
     return sorted(coverage.known_adapter_names())
 
 
-def _verify(name: str, max_records: int = 5) -> int:
-    """Load the freshly-written generated adapter and count records it produces."""
+def _verify(name: str, max_records: int = 5, max_seconds: float = 120.0) -> int:
+    """Load + run the generated adapter in a SUBPROCESS with a hard timeout, and
+    count records (returns -1 on any error or timeout = unverified).
+
+    A subprocess is the only reliable wall-clock cap: a built-but-broken adapter
+    (e.g. a slow name-pair brute-forcer that yields nothing) would otherwise block
+    the loop for many minutes until it exhausts its whole search. ``for _ in a.run()``
+    is arity-agnostic (handles 2- and 3-tuple person-keyed adapters)."""
+    import subprocess
+    import sys
+
+    code = (
+        "from web_scrubber.discovery import load_adapter\n"
+        f"a = load_adapter({name!r}, {ADAPTER_PACKAGE!r}, {str(ADAPTERS_OUT)!r})\n"
+        "n = 0\n"
+        "for _ in a.run():\n"
+        "    n += 1\n"
+        f"    if n >= {max_records}:\n        break\n"
+        "print(n)\n"
+    )
     try:
-        from web_scrubber.discovery import load_adapter
-        adapter = load_adapter(name, ADAPTER_PACKAGE, ADAPTERS_OUT)
-        n = 0
-        for _record, _photos in adapter.run():
-            n += 1
-            if n >= max_records:
-                break
-        return n
-    except Exception:  # noqa: BLE001 — any load/fetch/parse error = unverified
+        proc = subprocess.run(
+            [sys.executable, "-c", code], cwd=str(coverage.PROJECT_ROOT),
+            capture_output=True, text=True, timeout=max_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return -1
+    out = (proc.stdout or "").strip().splitlines()
+    try:
+        return int(out[-1]) if out else -1
+    except ValueError:
         return -1
 
 
