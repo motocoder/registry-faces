@@ -44,22 +44,7 @@ def _offense_key(o: Offense) -> tuple:
 
 
 def _merge_addresses(old: list[Address], new: list[Address]) -> list[Address]:
-    by_key: dict[tuple, Address] = {_addr_key(a): a for a in old}
-    for a in new:
-        k = _addr_key(a)
-        if k in by_key:
-            existing = by_key[k]
-            if a.verified_at and (
-                existing.verified_at is None or a.verified_at > existing.verified_at
-            ):
-                existing.verified_at = a.verified_at
-            if existing.lat is None and a.lat is not None:
-                existing.lat = a.lat
-            if existing.lon is None and a.lon is not None:
-                existing.lon = a.lon
-        else:
-            by_key[k] = a
-    return list(by_key.values())
+    return _merge.merge_addresses(old, new, _addr_key, newer_attr="verified_at")
 
 
 def _merge_identity(old: Identity, new: Identity) -> Identity:

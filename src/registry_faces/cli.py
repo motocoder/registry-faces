@@ -17,14 +17,13 @@ Global option:
 
 from __future__ import annotations
 
-import importlib.util
 import os
 from pathlib import Path
 
 import click
 from dotenv import load_dotenv
+from web_scrubber.discovery import AdapterNotFound, load_adapter as _ws_load_adapter
 
-from .adapters.base import Adapter
 from .agent.builder import build_adapter_from_url, resolve_mode
 from .agent.providers import PRESETS, list_presets
 from .photos import iter_person_dirs, sync_photos, verify_person_photos
@@ -43,33 +42,13 @@ REGISTRY_FIELD_CHECKS = [
 ]
 
 
-def _load_adapter(name: str) -> Adapter:
-    # First try in-package adapters (registry_faces.adapters.<name>)
-    pkg_module_name = f"registry_faces.adapters.{name}"
+def _load_adapter(name: str):
     try:
-        import importlib
-
-        module = importlib.import_module(pkg_module_name)
-    except ImportError:
-        module = None
-
-    if module is None:
-        # Fall back to user-generated adapters in ./adapters_generated/
-        path = ADAPTERS_OUT / f"{name}.py"
-        if not path.exists():
-            raise click.ClickException(
-                f"No adapter named {name!r}. Looked in registry_faces.adapters "
-                f"and {path}. Run `registry-faces build <url> --name {name}` first."
-            )
-        spec = importlib.util.spec_from_file_location(f"adapters_generated.{name}", path)
-        if spec is None or spec.loader is None:
-            raise click.ClickException(f"Could not load {path}.")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-    if not hasattr(module, "build"):
-        raise click.ClickException(f"Adapter {name!r} has no build() function.")
-    return module.build()
+        return _ws_load_adapter(name, "registry_faces.adapters", ADAPTERS_OUT)
+    except AdapterNotFound as e:
+        raise click.ClickException(str(e)) from e
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
 
 
 def _load_env_file() -> Path | None:
@@ -610,7 +589,9 @@ def enrich_details(target: str | None, config_path: str, limit: int | None,
 @click.option("--config", "config_path", default="identity.properties",
               type=click.Path(dir_okay=False), show_default=True)
 @click.option("--dry-run", is_flag=True, help="Report what would change without writing.")
-def regeocode_hbase(config_path: str, dry_run: bool) -> None:
+@click.option("--force-unlock", "force_unlock", is_flag=True,
+              help="Clear a stale ingest lock before acquiring (use when a prior run crashed).")
+def regeocode_hbase(config_path: str, dry_run: bool, force_unlock: bool) -> None:
     """Re-geocode existing REGISTRY attachments in HBase (disperse state/zip).
 
     Fixes data ingested before dispersing geocoding: tens of thousands of
@@ -629,12 +610,16 @@ def regeocode_hbase(config_path: str, dry_run: bool) -> None:
     from web_scrubber.geocode import geocode_address, state_from_jurisdiction
     from web_scrubber.person.config import load_config
     from web_scrubber.person.hbase import IngestLock
+    from web_scrubber.person.hbase import force_unlock as _force_unlock
 
     cfg = load_config(config_path)
     conn = happybase.Connection(
         host=cfg.hbase_host, port=cfg.hbase_port,
         table_prefix=cfg.hbase_table_prefix or None,
     )
+    if force_unlock:
+        msg = _force_unlock(conn)
+        click.echo(f"force-unlock: {msg}")
     person = conn.table("person")
     lock = IngestLock(conn, owner="registry-faces:regeocode-hbase").acquire()
     click.echo(f"lock acquired; scanning person table (dry_run={dry_run}) ...")
