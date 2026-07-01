@@ -164,6 +164,32 @@ def build(
     click.echo(report)
 
 
+@cli.command("expand")
+@click.option("--regions", default=None, help="path to an expand_countries.toml (countries/pacing).")
+@click.option("--engine", default=None, help="agent engine: claude (default) or a provider preset.")
+@click.option("--model", default=None, help="override the agent model.")
+@click.option("--country", default=None, help="restrict to one ISO-3166 alpha-2 code.")
+@click.option("--delay", type=float, default=None, help="seconds between iterations.")
+@click.option("--max-per-day", "max_per_day", type=int, default=None,
+              help="cap successful additions per day (0 = unlimited).")
+@click.option("--once", is_flag=True, help="run a single iteration then exit.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="scout + verify but make no ledger write.")
+def expand(regions, engine, model, country, delay, max_per_day, once, dry_run) -> None:
+    """Continuously discover + build per-country sex-offender-registry adapters (LLM agent).
+
+    Walks every ISO-3166 country in docs/country_coverage.csv: asks the agent to find
+    a PUBLIC registry and write an adapter, verifies records, and records covered /
+    unsupported (most countries are unsupported — public registries are rare).
+    """
+    from types import SimpleNamespace
+
+    from .expand import run_expand
+
+    raise SystemExit(run_expand(SimpleNamespace(
+        regions=regions, engine=engine, model=model, country=country,
+        delay=delay, max_per_day=max_per_day, once=once, dry_run=dry_run)))
+
+
 # ---------------------------------------------------------------------------
 # Ingest
 
@@ -542,8 +568,13 @@ def sync_identity_photos(target: str | None, config_path: str, refresh: bool, pa
 @click.option("--shard", default=None,
               help="Process only a hash-slice 'i/N' of persons, so N processes "
                    "can run in parallel (e.g. --shard 0/20 ... --shard 19/20).")
+@click.option("--headless/--headed", "headless", default=True, show_default=True,
+              help="Run Chromium headless (no on-screen windows). Headless is the "
+                   "right default for bulk state-registry pages; use --headed only "
+                   "for sites whose bot gate defeats headless (rare here).")
 def enrich_details(target: str | None, config_path: str, limit: int | None,
-                   pause_seconds: float, kind: str, shard: str | None) -> None:
+                   pause_seconds: float, kind: str, shard: str | None,
+                   headless: bool) -> None:
     """Backfill physical specs by fetching each person's detail page.
 
     Fills ONLY missing race / eye / hair / height / weight / age fields (the
@@ -569,7 +600,8 @@ def enrich_details(target: str | None, config_path: str, limit: int | None,
                f"kind={kind}, shard={shard or 'all'})")
     # lock=False: an idempotent backfill that only fills gaps — don't contend
     # with an in-progress ingest's single-writer lock.
-    with build_identity_service(cfg, lock=False) as bundle, BrowserFetcher() as fetcher:
+    with build_identity_service(cfg, lock=False) as bundle, \
+            BrowserFetcher(headless=headless) as fetcher:
         def fetch_html(url: str) -> str | None:
             time.sleep(pause_seconds)
             try:

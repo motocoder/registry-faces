@@ -35,3 +35,8 @@ venv/
 /shards_*/
 
 identity-store/
+
+# expand loop runtime state
+.expand/
+.web-scrubber-cache/
+adapters_generated/__pycache__/

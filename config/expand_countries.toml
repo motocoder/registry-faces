@@ -1,0 +1,18 @@
+# Countries + pacing for the per-country fugitive-source discovery loop.
+#   wanted-faces expand --regions config/expand_countries.toml --engine claude
+# Read when the loop starts (Resume in the control panel).
+
+# ISO-3166-1 alpha-2 codes to discover sources for. Empty = every country in
+# docs/country_coverage.csv (status=searched). Give each machine a DISJOINT subset
+# to parallelize without colliding on the ledger.
+countries = []
+
+[engine]
+name  = "claude"   # "claude" (Claude Code CLI) or an ollama/provider preset
+model = ""
+
+[pacing]
+delay_seconds        = 10
+max_per_day          = 0      # cap successful additions/day (0 = unlimited)
+agent_timeout        = 1800
+research_idle_seconds = 3600
