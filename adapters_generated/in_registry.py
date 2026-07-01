@@ -42,7 +42,7 @@ from registry_faces.schema import (
     OffenderRecord,
     Source,
 )
-from registry_faces.photos import PhotoRef
+from web_scrubber.photos import PhotoRef
 from registry_faces.adapters.base import Adapter
 
 LISTING = (
