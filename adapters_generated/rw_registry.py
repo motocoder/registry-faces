@@ -38,7 +38,7 @@ from registry_faces.schema import (
     Registration,
     Source,
 )
-from registry_faces.photos import PhotoRef
+from web_scrubber.photos import PhotoRef
 from registry_faces.adapters.base import Adapter
 
 BASE = "https://sor.nppa.gov.rw"

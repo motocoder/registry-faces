@@ -40,3 +40,4 @@ identity-store/
 .expand/
 .web-scrubber-cache/
 adapters_generated/__pycache__/
+logs/
