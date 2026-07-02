@@ -23,7 +23,7 @@ from .coverage import Target
 from .prompts import build_prompt
 
 try:
-    from web_scrubber.control.protocol import emit_progress as _emit
+    from web_scrubber.progress import emit_progress as _emit
 except Exception:  # pragma: no cover
     def _emit(task, status, *, region="", message="", counts=None, file=None):
         print(f"[{task}] {status} {region} {message} {counts or ''}".rstrip(), flush=True)
