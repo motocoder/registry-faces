@@ -36,6 +36,7 @@ import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -218,10 +219,15 @@ class MontanaAdapter(Adapter):
         )
         _ = noncompliant  # preserved in raw for clients that care
 
+        # Montana retired the offender-details.aspx viewer — every RecordKey now
+        # 404s — yet the FeatureServer still publishes the stale detail_url. Link
+        # instead to the FeatureServer's own per-offender REST view (f=html): a
+        # stable, live page for THIS record, keyed by the PERS_SID we already hold.
+        # (The old PUBLIC_VIEWER + detail_url is preserved in raw for reference.)
         info_url = None
-        detail = raw.get("detail_url")
-        if detail:
-            info_url = f"{PUBLIC_VIEWER}{detail}"
+        if sid:
+            where = quote(f"PERS_SID='{sid}'")
+            info_url = f"{FEATURE_SERVER}/query?where={where}&outFields=*&returnGeometry=false&f=html"
 
         return OffenderRecord(
             source=Source(

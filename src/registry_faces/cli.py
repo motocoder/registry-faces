@@ -96,6 +96,11 @@ def cli(ctx: click.Context, registry_root: str, env_file: str | None) -> None:
         ctx.ensure_object(dict)
         ctx.obj["env_file"] = loaded_from
     ctx.obj["registry_root"] = Path(registry_root)
+    # Committed default (free-tier) Geocodio key so the nightly run works with
+    # zero per-machine setup. A shell var or .env entry still overrides it.
+    # Intentionally checked in — it's a free key with a 2,500/day cap; rotate it
+    # if this repo goes public or the key ever gets billing attached.
+    os.environ.setdefault("GEOCODIO_API_KEY", "6645faa6711185475c2756f3cf6a66c85468516")
 
 
 # ---------------------------------------------------------------------------
@@ -623,23 +628,42 @@ def enrich_details(target: str | None, config_path: str, limit: int | None,
 @click.option("--dry-run", is_flag=True, help="Report what would change without writing.")
 @click.option("--force-unlock", "force_unlock", is_flag=True,
               help="Clear a stale ingest lock before acquiring (use when a prior run crashed).")
-def regeocode_hbase(config_path: str, dry_run: bool, force_unlock: bool) -> None:
-    """Re-geocode existing REGISTRY attachments in HBase (disperse state/zip).
+@click.option("--limit", type=int, default=0,
+              help="Stop after ~N persons (0 = whole table). For dry-run validation.")
+@click.option("--census-only", "census_only", is_flag=True,
+              help="Free run: skip the paid Geocodio tier (Census street + city/offline best-guess only).")
+@click.option("--cursor-file", "cursor_file", default=None,
+              help="Resume cursor file (default: <file_root>/regeocode-cursor.txt). Cleared on a full sweep.")
+def regeocode_hbase(
+    config_path: str, dry_run: bool, force_unlock: bool, limit: int = 0,
+    census_only: bool = False, cursor_file: str | None = None,
+) -> None:
+    """Street-geocode REGISTRY attachments in HBase (Census→Geocodio, offline fallback).
 
-    Fixes data ingested before dispersing geocoding: tens of thousands of
-    registry records were placed on the bare STATE CENTROID
-    (geo_precision=state), so they stack on one point and the map can't break the
-    cluster by zooming. This re-derives each registry address through the
-    dispersing geocoder (state bbox / zip-city radius / random fallback), keeps
-    genuine source coords (exact), and bumps i:json so the map delta-pull picks
-    it up. Takes the global ingest lock; re-run if held.
+    Confirms each registry address to a SPECIFIC point where one exists: the
+    Census batch geocoder (free, US street-level) then Geocodio (misses +
+    territories) resolve real street coordinates (geo_precision rooftop/street,
+    or a small-town centroid = city). Whatever can't be street-confirmed falls
+    back to the offline disperser (state bbox / zip-city radius / random) — those
+    coarse rows are what the map keep-rule then drops. Genuine source coords
+    (exact) are never overwritten. Bumps i:json so the map delta-pull picks it up.
+    Takes the global ingest lock; re-run if held.
+
+    Set GEOCODIO_API_KEY (via .env) to enable the Geocodio tier; without it the
+    run is Census-only.
     """
     import json
+    import os
+    import time
     from collections import Counter
+    from pathlib import Path
 
     import happybase
 
-    from web_scrubber.geocode import geocode_address, state_from_jurisdiction
+    from web_scrubber.geocode import disperse_in_radius, geocode_address, state_from_jurisdiction
+    from web_scrubber.hbase_scan import iter_scan
+    from web_scrubber.small_places import city_centroid
+    from web_scrubber.street_geocode import street_geocode
     from web_scrubber.person.config import load_config
     from web_scrubber.person.hbase import IngestLock
     from web_scrubber.person.hbase import force_unlock as _force_unlock
@@ -653,13 +677,96 @@ def regeocode_hbase(config_path: str, dry_run: bool, force_unlock: bool) -> None
         msg = _force_unlock(conn)
         click.echo(f"force-unlock: {msg}")
     person = conn.table("person")
+    # Resume across tunnel-drop crashes: the cursor is the last row written; a
+    # re-run continues after it (re-geocoding is idempotent, so overlap is safe).
+    cursor_path = Path(cursor_file) if cursor_file else Path(cfg.file_root) / "regeocode-cursor.txt"
+    prev_cursor = cursor_path.read_text().strip() if cursor_path.exists() else ""
+    start_row = prev_cursor.encode("utf-8") if prev_cursor else None
+    if start_row:
+        click.echo(f"resuming after cursor: {prev_cursor}")
     lock = IngestLock(conn, owner="registry-faces:regeocode-hbase").acquire()
     click.echo(f"lock acquired; scanning person table (dry_run={dry_run}) ...")
     prec: Counter = Counter()
     n_person = n_att = n_addr = 0
+    geocodio_key = None if census_only else os.environ.get("GEOCODIO_API_KEY")
+    click.echo(f"geocodio fallback: {'enabled' if geocodio_key else 'DISABLED (free: census + city/offline)'}")
+
+    # Street-first geocoding runs in BATCHES (Census accepts ≤10k/request), so we
+    # buffer non-exact registry addresses across rows, resolve a batch through the
+    # Census→Geocodio cascade, and fall back to the offline disperser for whatever
+    # can't be street-confirmed. A row's addresses are fully appended before the
+    # size check, so an attachment is never split across a flush (its JSON is
+    # rewritten whole). Idempotent: a re-seen row re-geocodes to the same result.
+    BATCH = 4000
+    addr_buf: list[tuple] = []  # (att, addr_dict, jur, sid, index)
+    row_buf: dict[bytes, dict] = {}  # ukey -> {"ij": bytes|None, "cols": {col: att}}
+
+    def flush() -> None:
+        nonlocal n_person, n_att
+        if not addr_buf:
+            return
+        cands = {
+            str(idx): {"street": a.get("street"), "city": a.get("city"),
+                       "state": a.get("state"), "zip": a.get("zip")}
+            for idx, (_att, a, _j, _s, _i) in enumerate(addr_buf)
+            if a.get("street") and a.get("state")
+        }
+        hits = street_geocode(cands, geocodio_key=geocodio_key) if cands else {}
+        touched: set[int] = set()
+        for idx, (att, a, jur, sid, i) in enumerate(addr_buf):
+            r = hits.get(str(idx))
+            if r is not None:
+                a["lat"], a["lon"], a["geo_precision"] = r.lat, r.lon, r.source
+            else:
+                # Free best-guess for a real address we couldn't street-confirm:
+                # the CITY centroid (jittered so a city's registrants don't stack
+                # on one point), far better than a random in-state scatter. Only
+                # the truly city-less fall through to the offline state disperser.
+                cc = city_centroid(a.get("state"), a.get("city"))
+                if cc is not None:
+                    dlat, dlon = disperse_in_radius(cc[0], cc[1], f"{jur}:{sid}:{i}")
+                    a["lat"], a["lon"], a["geo_precision"] = dlat, dlon, "city"
+                else:
+                    res = geocode_address(
+                        seed=f"{jur}:{sid}:{i}", state=a.get("state"), city=a.get("city"),
+                        country=a.get("country"), fallback_state=state_from_jurisdiction(jur),
+                    )
+                    a["lat"], a["lon"], a["geo_precision"] = res.lat, res.lon, res.source
+            prec[a["geo_precision"]] += 1
+            touched.add(id(att))
+        n_att += len(touched)
+        if not dry_run and row_buf:
+            for attempt in range(4):
+                try:
+                    for ukey, info in row_buf.items():
+                        updates = {col.encode("utf-8"): json.dumps(att).encode("utf-8")
+                                   for col, att in info["cols"].items()}
+                        if info["ij"]:
+                            updates[b"i:json"] = info["ij"]  # bump ts for map delta-pull
+                        person.put(ukey, updates)
+                    break
+                except Exception as e:  # tunnel blip mid-write -> reconnect + retry (idempotent)
+                    if attempt == 3:
+                        raise
+                    click.echo(f"  ! write failed ({type(e).__name__}); reconnecting + retrying")
+                    time.sleep(3)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn.open()
+            cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            cursor_path.write_text(max(row_buf).decode("utf-8"))  # resume point
+        n_person += len(row_buf)
+        addr_buf.clear()
+        row_buf.clear()
+        click.echo(f"  ... {n_person} persons")
+
+    completed_sweep = False
     try:
-        for ukey, row in person.scan(columns=[b"a", b"i"], batch_size=500):
-            changed = False
+        for ukey, row in iter_scan(person, conn, columns=[b"a", b"i"], row_start=start_row,
+                                   batch_size=200, max_restarts=20):
+            ij = row.get(b"i:json")
             for col, val in list(row.items()):
                 c = col.decode()
                 if not c.startswith("a:criminal:registry:"):
@@ -667,37 +774,139 @@ def regeocode_hbase(config_path: str, dry_run: bool, force_unlock: bool) -> None
                 att = json.loads(val)
                 src = att.get("source", {}) or {}
                 jur, sid = src.get("jurisdiction", ""), src.get("source_id", "")
-                fb = state_from_jurisdiction(jur)
-                att_changed = False
+                staged = False
                 for i, a in enumerate(att.get("addresses") or []):
                     n_addr += 1
                     if a.get("geo_precision") == "exact" and a.get("lat") is not None:
-                        prec["exact"] += 1
+                        prec["exact"] += 1  # genuine source coord — never overwritten
                         continue
-                    res = geocode_address(
-                        seed=f"{jur}:{sid}:{i}", state=a.get("state"),
-                        city=a.get("city"), country=a.get("country"), fallback_state=fb,
-                    )
-                    a["lat"], a["lon"], a["geo_precision"] = res.lat, res.lon, res.source
-                    prec[res.source] += 1
-                    att_changed = True
-                if att_changed:
-                    n_att += 1
-                    if not dry_run:
-                        person.put(ukey, {col: json.dumps(att).encode("utf-8")})
-                    changed = True
-            if changed:
-                n_person += 1
-                ij = row.get(b"i:json")
-                if ij and not dry_run:
-                    person.put(ukey, {b"i:json": ij})  # bump ts for map delta-pull
-                if n_person % 2000 == 0:
-                    click.echo(f"  ... {n_person} persons")
+                    addr_buf.append((att, a, jur, sid, i))
+                    staged = True
+                if staged:
+                    row_buf.setdefault(ukey, {"ij": ij, "cols": {}})["cols"][c] = att
+            if len(addr_buf) >= BATCH:
+                flush()
+            if limit and (n_person + len(row_buf)) >= limit:
+                break
+        else:
+            completed_sweep = True  # loop exhausted (not limit-broken) -> whole table done
+        flush()
+        if completed_sweep and not dry_run and cursor_path.exists():
+            cursor_path.unlink()  # full sweep -> reset the resume cursor for next time
     finally:
         lock.release()
     click.echo(f"persons updated={n_person} attachments={n_att} addresses={n_addr}")
+    if completed_sweep:
+        click.echo("REGEOCODE_COMPLETE")
     for p, c in prec.most_common():
         click.echo(f"  {p:10s} {c}")
+
+
+@cli.command("upgrade-geocode-hbase")
+@click.option("--config", "config_path", default="identity.properties",
+              type=click.Path(dir_okay=False), show_default=True)
+@click.option("--dry-run", is_flag=True, help="Report what would upgrade without writing.")
+@click.option("--limit", type=int, default=2400, show_default=True,
+              help="Max Geocodio lookups this run (free tier = 2500/day; stay under it).")
+@click.option("--cursor-file", "cursor_file", default=None,
+              help="Cursor state file (default: <file_root>/geocode-upgrade-cursor.txt).")
+def upgrade_geocode_hbase(
+    config_path: str, dry_run: bool, limit: int = 2400, cursor_file: str | None = None
+) -> None:
+    """Free-tier Geocodio upgrade of best-guess registry pins to real street coords.
+
+    Promotes up to LIMIT ``city``/``state`` (best-guess) registry addresses that
+    carry a real street to a Geocodio ``rooftop``/``street`` match. Cursor-paged
+    so successive nightly runs cycle through the whole table, staying inside
+    Geocodio's 2,500/day FREE allowance — the ~180k backlog upgrades itself over
+    ~2-3 months at zero cost. Only actual street matches are applied; a Geocodio
+    miss leaves the pin at its best-guess. Needs GEOCODIO_API_KEY (via .env).
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    import happybase
+
+    from web_scrubber.geocodio_geocoder import GeocodioGeocoder
+    from web_scrubber.hbase_scan import iter_scan
+    from web_scrubber.person.config import load_config
+    from web_scrubber.person.hbase import IngestLock
+
+    geo = GeocodioGeocoder(os.environ.get("GEOCODIO_API_KEY"))
+    if not geo.enabled:
+        click.echo("GEOCODIO_API_KEY not set — nothing to do")
+        return
+
+    cfg = load_config(config_path)
+    conn = happybase.Connection(
+        host=cfg.hbase_host, port=cfg.hbase_port,
+        table_prefix=cfg.hbase_table_prefix or None,
+    )
+    person = conn.table("person")
+    cursor_path = Path(cursor_file) if cursor_file else Path(cfg.file_root) / "geocode-upgrade-cursor.txt"
+    prev = cursor_path.read_text().strip() if cursor_path.exists() else ""
+    start = prev.encode("utf-8") if prev else None
+
+    cands: dict[str, dict] = {}          # key -> address parts (one per candidate)
+    refs: dict[str, tuple] = {}          # key -> (ukey, col, addr_dict)
+    rows: dict[bytes, dict] = {}         # ukey -> {"ij": bytes|None, "cols": {col: att}}
+    last: bytes | None = None
+    wrapped = True  # stays True only if the scan reaches the table end this run
+
+    lock = IngestLock(conn, owner="registry-faces:upgrade-geocode").acquire()
+    try:
+        for ukey, row in iter_scan(person, conn, columns=[b"a", b"i"], row_start=start,
+                                   batch_size=200, max_restarts=10):
+            last = ukey
+            ij = row.get(b"i:json")
+            for col, val in list(row.items()):
+                c = col.decode()
+                if not c.startswith("a:criminal:registry:"):
+                    continue
+                att = json.loads(val)
+                for i, a in enumerate(att.get("addresses") or []):
+                    if a.get("geo_precision") not in ("city", "state"):
+                        continue  # already street/rooftop/exact — or unlocatable
+                    if not (a.get("street") or "").strip():
+                        continue  # no street to confirm
+                    key = f"{ukey.decode()}|{c}|{i}"
+                    cands[key] = {"street": a.get("street"), "city": a.get("city"),
+                                  "state": a.get("state"), "zip": a.get("zip")}
+                    refs[key] = (ukey, c, a)
+                    rows.setdefault(ukey, {"ij": ij, "cols": {}})["cols"][c] = att
+            if len(cands) >= limit:
+                wrapped = False
+                break
+
+        hits = geo.geocode(cands) if cands else {}
+        dirty: set[bytes] = set()
+        upgraded = 0
+        for key, r in hits.items():
+            if r.source not in ("rooftop", "street"):
+                continue  # a coarse Geocodio result is no better than our best-guess
+            ukey, _c, a = refs[key]
+            a["lat"], a["lon"], a["geo_precision"] = r.lat, r.lon, r.source
+            dirty.add(ukey)
+            upgraded += 1
+
+        if not dry_run:
+            for ukey in dirty:
+                info = rows[ukey]
+                updates = {col.encode("utf-8"): json.dumps(att).encode("utf-8")
+                           for col, att in info["cols"].items()}
+                if info["ij"]:
+                    updates[b"i:json"] = info["ij"]  # bump ts for map delta-pull
+                person.put(ukey, updates)
+            # Advance the cursor (or reset to the top once we've swept the table).
+            cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            cursor_path.write_text("" if wrapped else (last.decode("utf-8") if last else ""))
+    finally:
+        lock.release()
+    click.echo(
+        f"geocodio upgrade: candidates={len(cands)} upgraded={upgraded} "
+        f"cursor={'wrapped-to-top' if wrapped else 'advanced'} (dry_run={dry_run})"
+    )
 
 
 @cli.command()
