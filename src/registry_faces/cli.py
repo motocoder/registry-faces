@@ -177,9 +177,13 @@ def build(
 @click.option("--delay", type=float, default=None, help="seconds between iterations.")
 @click.option("--max-per-day", "max_per_day", type=int, default=None,
               help="cap successful additions per day (0 = unlimited).")
+@click.option("--max-hours", "max_hours", type=float, default=None,
+              help="graceful wall-clock budget in hours; stops between iterations (0 = unlimited).")
 @click.option("--once", is_flag=True, help="run a single iteration then exit.")
 @click.option("--dry-run", "dry_run", is_flag=True, help="scout + verify but make no ledger write.")
-def expand(regions, engine, model, country, delay, max_per_day, once, dry_run) -> None:
+@click.option("--supervise", is_flag=True,
+              help="run under a crash-restart supervisor for unattended overnight runs.")
+def expand(regions, engine, model, country, delay, max_per_day, max_hours, once, dry_run, supervise) -> None:
     """Continuously discover + build per-country sex-offender-registry adapters (LLM agent).
 
     Walks every ISO-3166 country in docs/country_coverage.csv: asks the agent to find
@@ -192,7 +196,8 @@ def expand(regions, engine, model, country, delay, max_per_day, once, dry_run) -
 
     raise SystemExit(run_expand(SimpleNamespace(
         regions=regions, engine=engine, model=model, country=country,
-        delay=delay, max_per_day=max_per_day, once=once, dry_run=dry_run)))
+        delay=delay, max_per_day=max_per_day, max_hours=max_hours,
+        once=once, dry_run=dry_run, supervise=supervise)))
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +912,124 @@ def upgrade_geocode_hbase(
         f"geocodio upgrade: candidates={len(cands)} upgraded={upgraded} "
         f"cursor={'wrapped-to-top' if wrapped else 'advanced'} (dry_run={dry_run})"
     )
+
+
+@cli.command("regeocode-events-hbase")
+@click.option("--config", "config_path", default="identity.properties",
+              type=click.Path(dir_okay=False), show_default=True)
+@click.option("--dry-run", is_flag=True, help="Report what would move without writing.")
+@click.option("--limit", type=int, default=0, help="Stop after ~N events (0 = all).")
+def regeocode_events_hbase(config_path: str, dry_run: bool, limit: int = 0) -> None:
+    """Relocate crime-crawler event pins that fell into the ocean (state-bbox
+    dispersion) to their real city.
+
+    Before geocode_address gained the offline city tier, an event naming a real
+    city (e.g. "Tallahassee, FL") with online geocoding off dispersed across the
+    whole state bbox — landing in the Gulf/Atlantic for coastal states. This
+    parses "City, ST" from the article body header, re-geocodes through the now
+    city-aware geocoder (seeded by event_uuid so events don't stack), and rewrites
+    the event's lat/lon (and its article's) wherever the point moves materially.
+    Idempotent: a re-run leaves already-correct pins untouched.
+    """
+    import json
+    import re
+    import time
+
+    import happybase
+
+    from web_scrubber.geocode import disperse_in_radius, geocode_address, is_water_coord
+    from web_scrubber.person.config import load_config
+    from web_scrubber.small_places import county_centroid
+
+    cfg = load_config(config_path)
+    conn = happybase.Connection(
+        host=cfg.hbase_host, port=cfg.hbase_port,
+        table_prefix=cfg.hbase_table_prefix or None,
+    )
+    events = conn.table("article_event")
+    articles = conn.table("article")
+    city_re = re.compile(r"—\s*([^,—\n]+),\s*([A-Z]{2})\s*—")
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())
+
+    def _county_from_jur(jur: str) -> tuple[str, str] | tuple[None, None]:
+        # "US-FL-MonroeFL" -> ("Monroe", "FL"); the county segment carries a
+        # trailing state-code suffix that we strip.
+        parts = (jur or "").split("-")
+        if len(parts) < 3 or parts[0] != "US":
+            return None, None
+        st, seg = parts[1].upper(), parts[2]
+        if len(seg) > len(st) and seg.upper().endswith(st):
+            seg = seg[: -len(st)]
+        return (seg, st) if seg else (None, None)
+
+    scanned = parsed = moved = 0
+
+    def _reconnect() -> None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.open()
+
+    for ekey, row in events.scan(columns=[b"e"]):
+        scanned += 1
+        try:
+            ev = json.loads(row.get(b"e:json", b"{}"))
+        except (ValueError, TypeError):
+            continue
+        if ev.get("originator") not in ("crime-crawler", "crime-watcher"):
+            continue
+        auuids = ev.get("article_uuids") or []
+        if not auuids:
+            continue
+        try:
+            aj = json.loads(articles.row(auuids[0].encode(), columns=[b"a:en"]).get(b"a:en", b"{}"))
+        except Exception:
+            continue
+        new_lat = new_lon = None
+        # 1) Structured "City, ST" body line -> city centroid.
+        m = city_re.search(aj.get("body") or "")
+        if m:
+            city, st = m.group(1).strip(), m.group(2).strip()
+            res = geocode_address(seed=ev["event_uuid"], city=city, state=st, fallback_state=st)
+            if res.source == "city":
+                new_lat, new_lon = res.lat, res.lon
+        # 2) Fallback: county from the jurisdiction (jail-booking feeds like
+        #    US-FL-MonroeFL name only a county) -> county centroid (on land),
+        #    which coastal counties otherwise miss by dispersing into the ocean.
+        #    Gated on is_water_coord: a coarse county centroid must only RESCUE a
+        #    booking stuck over water, never displace one already placed on land.
+        if new_lat is None and is_water_coord(ev.get("lat"), ev.get("lon"), "state"):
+            county, cst = _county_from_jur(ev.get("booking_jurisdiction") or "")
+            cc = county_centroid(cst, county) if county else None
+            if cc is not None:
+                new_lat, new_lon = disperse_in_radius(cc[0], cc[1], ev["event_uuid"])
+        if new_lat is None:
+            continue
+        parsed += 1
+        ol, on = ev.get("lat"), ev.get("lon")
+        if ol is not None and abs(new_lat - ol) < 0.02 and abs(new_lon - on) < 0.02:
+            continue  # already at (near) the right place — idempotent skip
+        ev["lat"], ev["lon"], ev["last_updated_at"] = new_lat, new_lon, now_iso
+        aj["lat"], aj["lon"] = new_lat, new_lon  # keep the article copy in sync
+        moved += 1
+        if not dry_run:
+            for attempt in range(4):
+                try:
+                    events.put(ekey, {b"e:json": json.dumps(ev).encode("utf-8")})
+                    articles.put(auuids[0].encode(), {b"a:en": json.dumps(aj).encode("utf-8")})
+                    break
+                except Exception as e:
+                    if attempt == 3:
+                        raise
+                    click.echo(f"  ! write failed ({type(e).__name__}); reconnecting")
+                    time.sleep(3)
+                    _reconnect()
+        if moved % 100 == 0:
+            click.echo(f"  ... {moved} relocated")
+        if limit and moved >= limit:
+            break
+    click.echo(f"events scanned={scanned} parseable={parsed} relocated={moved} (dry_run={dry_run})")
 
 
 @cli.command()
