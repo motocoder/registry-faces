@@ -29,7 +29,8 @@ from .agent.providers import PRESETS, list_presets
 from .photos import iter_person_dirs, sync_photos, verify_person_photos
 from .store import FileStore
 
-ADAPTERS_OUT = Path("adapters_generated")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ADAPTERS_OUT = PROJECT_ROOT / "adapters_generated"
 
 # Canary fields for ingest health: if a registry's format changes, one of these
 # usually stops parsing and its coverage collapses (or the run yields 0 records

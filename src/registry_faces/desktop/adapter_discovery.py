@@ -2,7 +2,7 @@
 
 Two sources:
   * In-package adapters at `registry_faces.adapters.<name>` (excluding `base`).
-  * User-generated adapters in `./adapters_generated/*.py`.
+  * User-generated adapters in the project-root `adapters_generated/*.py`.
 
 Returns lightweight summaries — the actual Adapter instance is only built when
 the user clicks "Ingest" or "Sync Photos" via the CLI's existing loader.
@@ -19,7 +19,8 @@ from typing import Literal
 
 from .. import adapters as _pkg_adapters
 
-GENERATED_DIR = Path("adapters_generated")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+GENERATED_DIR = PROJECT_ROOT / "adapters_generated"
 EXCLUDED_PACKAGE_MODULES = {"base"}
 
 

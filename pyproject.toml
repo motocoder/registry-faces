@@ -25,6 +25,7 @@ gemini = ["google-genai>=0.4.0"]
 ui = ["PySide6>=6.6"]
 wa = ["playwright>=1.40"]
 dev = ["pytest>=8.0"]
+hbase = ["web-scrubber[hbase]"]
 # Shard tooling: package_shards.py uses Pillow to normalize photos;
 # upload_shards.py uses boto3's S3 client against R2's S3-compatible API
 # (Sig V4). Only needed when building/uploading shards.
@@ -38,6 +39,7 @@ all = [
     "pytest>=8.0",
     "boto3>=1.34",
     "Pillow>=10.0",
+    "web-scrubber[hbase]",
 ]
 
 [tool.pytest.ini_options]
