@@ -16,6 +16,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
+from web_scrubber.contact_harvest import harvest_payload
+
 from ..photos import PhotoRef
 from ..schema import OffenderRecord
 
@@ -44,4 +46,14 @@ class Adapter(ABC):
     def run(self) -> Iterator[tuple[OffenderRecord, list[PhotoRef]]]:
         """Default pipeline: fetch -> (normalize, extract_photos) per record."""
         for raw in self.fetch():
+            harvest_payload(
+                raw,
+                project="registry-faces",
+                source_system=f"{self.__class__.__module__}.{self.__class__.__name__}",
+                metadata={
+                    "jurisdiction": self.jurisdiction,
+                    "source_name": self.source_name,
+                    "ingress_path": "registry_faces.adapters.base.Adapter.run",
+                },
+            )
             yield self.normalize(raw), self.extract_photos(raw)
