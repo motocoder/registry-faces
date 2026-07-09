@@ -1,7 +1,7 @@
 Country,CountryName,Status,Adapter,SourceURL,Notes
-AD,Andorra,unsupported,,,Andorra operates no public sex-offender registry. Criminal records are handled only via the Consell Superior de la Justicia's paid personal 'antecedents penals' certificate (individual lookup issued t
-AE,United Arab Emirates,unsupported,,,"No public registry. UAE has only proposed (not enacted/deployed) a sex-offender registry; any such system is police/authority-only and privacy law shields criminal records. No official government-run,"
-AF,Afghanistan,unsupported,,,"No public government sex-offender registry. Afghanistan (Taliban administration) operates no online, enumerable, publicly searchable offender registry; no qualifying official source exists."
+AD,Andorra,unsupported,,,"Official source is an enumerable police news CMS, not a public sex-offender registry. Government/justice materials point to private antecedents-penals and negative sexual-offense certificates for empl"
+AE,United Arab Emirates,unsupported,,,No official UAE public sex-offender registry could be found. Official sources discuss an internal/list-based child-sex-offender register at the Ministry of Interior and member-country information shar
+AF,Afghanistan,unsupported,,,"No official Afghan government public sex-offender registry was found. Official justice sites expose court/news/bulletin content and case-management references, but not a public, enumerable registry of"
 AG,Antigua and Barbuda,unsupported,,,The National Sex Offender Register Act 2022 places the register under the Commissioner of Police; access requires a formal written application and grants only limited proximity info at the Commissione
 AI,Anguilla,unsupported,,,Anguilla (British Overseas Territory) keeps its sex offender register police-only; it is not published to the public in any enumerable online form. No registry surface on gov.ai / Royal Anguilla Polic
 AL,Albania,unsupported,,,"Albania's National Register of Sexual Crimes exists but is not an enumerable public registry: access is via the e-Albania portal requiring authenticated Albanian citizen credentials, and it only suppo"
