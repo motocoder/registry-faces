@@ -1,7 +1,7 @@
 # HANDOFF — backfill registry physical specs (race/eyes/hair/height/weight/age)
 
 **Run this on the Windows dev box (`C:/development`)** — it needs Playwright +
-chromium + the HBase tunnel, which the Mac checkout doesn't have. Goal: fill the
+chromium + Loki WireGuard HBase access. Goal: fill the
 missing physical specs for **all registry (NSOPW) states** into HBase.
 
 ## Why this is needed
@@ -37,10 +37,10 @@ cd C:/development/registry-faces
 .venv\Scripts\pip install -e ..\web-scrubber          # web_scrubber must be importable
 .venv\Scripts\pip install -e ".[all]"
 .venv\Scripts\playwright install chromium
-# bring up the HBase tunnel the nightly uses; confirm 127.0.0.1:9090 is open:
-C:/development/web-scrubber/shared-root/hbase/hbase-tunnel.ps1
+# bring up Loki WireGuard or the compatibility tunnel; confirm HBase Thrift is open:
+ssh loki "hostname"
 ```
-`identity.properties` is already set to `identity.mode=hbase`, `hbase.host=localhost`,
+`identity.properties` is already set to `identity.mode=hbase`, `hbase.host=10.10.0.2`,
 `hbase.port=9090`.
 
 ## Step 1 — spot-check FIRST (validate the extractor on real pages)
