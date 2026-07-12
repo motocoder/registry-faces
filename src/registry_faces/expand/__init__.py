@@ -39,7 +39,7 @@ PAUSE_FILE = Path.home() / ".web-scrubber" / "expand-registry-faces.pause"
 
 
 def _ledger():
-    return country_ledger(LEDGER_PATH)
+    return country_ledger(LEDGER_PATH, project="registry-faces")
 
 
 def make_source_code(t) -> str:
@@ -94,7 +94,7 @@ def build_spec() -> ExpandSpec:
 
 
 def run_expand(args) -> int:
-    ensure_country_ledger(LEDGER_PATH)
+    ensure_country_ledger(LEDGER_PATH, _ledger())
     if getattr(args, "supervise", False) and not already_supervised():
         return supervise_self(max_hours=getattr(args, "max_hours", None) or 0.0, pause_file=PAUSE_FILE)
     args.scope = build_scope(args)
