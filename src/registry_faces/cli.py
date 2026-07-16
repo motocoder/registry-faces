@@ -96,6 +96,9 @@ def cli(ctx: click.Context, registry_root: str, env_file: str | None) -> None:
         loaded_from = _load_env_file()
         ctx.ensure_object(dict)
         ctx.obj["env_file"] = loaded_from
+    from web_scrubber.remote_logging import configure_remote_logging
+
+    configure_remote_logging("registry-faces")
     ctx.obj["registry_root"] = Path(registry_root)
     # Committed default (free-tier) Geocodio key so the nightly run works with
     # zero per-machine setup. A shell var or .env entry still overrides it.
