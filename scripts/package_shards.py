@@ -1,7 +1,7 @@
 """Build shard bundles for the registry-recognizer Android client.
 
 Reads per-state records from ``records/US-XX/<userdir>/{record.json, photos/*}``
-and emits ``shards/US-XX/{manifest.json, shard-NNN.zip}`` ready to copy to
+and emits checksum-addressed ``shards/US-XX/{manifest.json, shard-*.zip}`` ready to copy to
 ``berserkr.llc``. Inside each shard zip the layout matches the client's
 parser (RegistryDownloadManager.userKey):
 
@@ -32,12 +32,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import io
 import json
 import logging
+import re
 import shutil
 import sys
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
@@ -69,6 +70,12 @@ PHOTO_SKIP_NAMES = {"manifest.json", ".DS_Store", "Thumbs.db"}
 # from the package-wide single source of truth so ingest, build, and upload
 # can't drift apart.
 from registry_faces.blacklist import BLACKLIST as SHARD_BLACKLIST
+from registry_faces.shards import (
+    content_addressed_shard_name,
+    parse_manifest,
+    publish_directory,
+    sha256_file,
+)
 
 
 # ---------- types --------------------------------------------------------
@@ -76,10 +83,12 @@ from registry_faces.blacklist import BLACKLIST as SHARD_BLACKLIST
 
 @dataclass
 class BundleMeta:
-    """Pass-1 record metadata. Cheap to hold N=91k of these in RAM
-    simultaneously (record.json bytes only — no photo payloads), so
-    the full sort by GUID can happen before any image I/O. Pass 2
-    consumes these in sorted order and loads photos just-in-time."""
+    """Pass-1 record metadata retained while the state is GUID-sorted.
+
+    Only paths and short sort keys remain resident.  Pass 1 briefly parses each
+    record for its GUID; pass 2 rereads that record beside its photos.  This
+    keeps memory bounded even when record JSON contains large raw payloads.
+    """
 
     # On-disk dir of this user — lets pass 2 reach the photos/ subdir
     # without re-walking from records-root.
@@ -92,10 +101,8 @@ class BundleMeta:
     # the v5 schema (no `identity.guid`). Falling back keeps the sort
     # deterministic even on partial data.
     guid: str
-    # Shipped verbatim — no re-serialize. The on-device parser is
-    # tolerant of unknown fields, so any registry-faces additions
-    # flow through without this script needing schema awareness.
-    record_json_bytes: bytes
+    # Reread in pass 2 and shipped verbatim — no re-serialize.
+    record_path: Path
 
 
 @dataclass
@@ -117,12 +124,26 @@ class Stats:
     users_seen: int = 0
     users_skipped_no_record: int = 0
     users_skipped_bad_json: int = 0
+    users_skipped_unsafe_path: int = 0
+    users_skipped_wrong_state: int = 0
     users_missing_guid: int = 0
     photos_normalized: int = 0
     photos_skipped: int = 0
 
 
 # ---------- image normalization ----------------------------------------
+
+
+def _safe_zip_segment(value: str) -> bool:
+    """Whether a local leaf is safe as one portable ZIP path segment."""
+
+    return bool(
+        value
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and all(ord(char) >= 32 for char in value)
+    )
 
 
 def normalize_image(src_bytes: bytes, max_edge: int, quality: int) -> bytes:
@@ -158,7 +179,15 @@ def scan_meta(user_dir: Path, stats: Stats) -> Optional[BundleMeta]:
     No image I/O — that happens in pass 2 just-in-time so peak memory
     stays bounded to one user's photos at a time. FL's 91k records
     would otherwise want ~4 GB simultaneously held in RAM."""
+    if user_dir.is_symlink() or not _safe_zip_segment(user_dir.name):
+        logger.warning("skip %s — unsafe/symlinked user directory", user_dir)
+        stats.users_skipped_unsafe_path += 1
+        return None
     record_path = user_dir / "record.json"
+    if record_path.is_symlink():
+        logger.warning("skip %s — record.json may not be a symlink", user_dir.name)
+        stats.users_skipped_unsafe_path += 1
+        return None
     if not record_path.is_file():
         logger.warning("skip %s — no record.json", user_dir.name)
         stats.users_skipped_no_record += 1
@@ -170,6 +199,24 @@ def scan_meta(user_dir: Path, stats: Stats) -> Optional[BundleMeta]:
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         logger.warning("skip %s — invalid record.json: %s", user_dir.name, e)
         stats.users_skipped_bad_json += 1
+        return None
+
+    if not isinstance(record_data, dict):
+        logger.warning("skip %s — record.json must be an object", user_dir.name)
+        stats.users_skipped_bad_json += 1
+        return None
+
+    source = record_data.get("source")
+    actual_state = source.get("jurisdiction") if isinstance(source, dict) else None
+    expected_state = user_dir.parent.name
+    if actual_state != expected_state:
+        logger.warning(
+            "skip %s — record jurisdiction %r does not match %s",
+            user_dir.name,
+            actual_state,
+            expected_state,
+        )
+        stats.users_skipped_wrong_state += 1
         return None
 
     guid = extract_guid(record_data)
@@ -184,7 +231,7 @@ def scan_meta(user_dir: Path, stats: Stats) -> Optional[BundleMeta]:
         user_dir=user_dir,
         userdir_name=user_dir.name,
         guid=guid,
-        record_json_bytes=record_bytes,
+        record_path=record_path,
     )
 
 
@@ -196,10 +243,26 @@ def load_photos(
     accumulate across the iteration."""
     photos: list[Photo] = []
     photos_dir = meta.user_dir / "photos"
+    if photos_dir.is_symlink():
+        logger.warning("skip photos for %s — directory is a symlink", meta.userdir_name)
+        stats.photos_skipped += 1
+        return photos
     if not photos_dir.is_dir():
         return photos
     for img_path in sorted(photos_dir.iterdir()):
-        if not img_path.is_file() or img_path.name in PHOTO_SKIP_NAMES:
+        if img_path.name in PHOTO_SKIP_NAMES:
+            continue
+        if (
+            img_path.is_symlink()
+            or not img_path.is_file()
+            or not _safe_zip_segment(img_path.name)
+        ):
+            logger.warning(
+                "skip image %s/%s — unsafe path or symlink",
+                meta.userdir_name,
+                img_path.name,
+            )
+            stats.photos_skipped += 1
             continue
         try:
             normalized = normalize_image(
@@ -261,16 +324,28 @@ def write_shards(
     # to the only loop that touches them.
     current_zip: Optional[zipfile.ZipFile] = None
     current_path: Optional[Path] = None
+    current_index: Optional[int] = None
     current_bytes_estimate = 0
     current_record_count = 0
 
+    def write_entry(archive_name: str, payload: bytes) -> None:
+        # ZipFile.writestr(str, ...) stamps wall-clock time. That makes identical
+        # inputs hash differently on every build, defeating upload skips and
+        # leaking an unbounded series of immutable objects into R2.
+        info = zipfile.ZipInfo(archive_name, date_time=(1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_STORED
+        info.create_system = 3
+        info.external_attr = 0o100644 << 16
+        current_zip.writestr(info, payload)
+
     def open_next() -> None:
-        nonlocal current_zip, current_path, shard_index
+        nonlocal current_zip, current_path, current_index, shard_index
         nonlocal current_bytes_estimate, current_record_count
         # Unprefixed name; the state is conveyed by the containing
         # directory (shards/<state>/) which becomes the server URL
         # path segment (<base>/<state>/<name>).
-        name = f"shard-{shard_index:03d}.zip"
+        current_index = shard_index
+        name = f"shard-{current_index:03d}.zip"
         shard_index += 1
         current_path = out_dir / name
         # ZIP_STORED — JPEG bytes don't compress meaningfully and
@@ -280,15 +355,20 @@ def write_shards(
         current_record_count = 0
 
     def close_current() -> None:
-        nonlocal current_zip, current_path
+        nonlocal current_zip, current_path, current_index
         if current_zip is None:
             return
         current_zip.close()
         size = current_path.stat().st_size
         sha = hash_file(current_path)
+        assert current_index is not None
+        immutable_path = current_path.with_name(
+            content_addressed_shard_name(current_index, sha)
+        )
+        current_path.rename(immutable_path)
         shards.append(
             ShardInfo(
-                name=current_path.name,
+                name=immutable_path.name,
                 size_bytes=size,
                 sha256=sha,
                 record_count=current_record_count,
@@ -296,53 +376,56 @@ def write_shards(
         )
         logger.info(
             "closed %s: %d records, %.1f MB",
-            current_path.name,
+            immutable_path.name,
             current_record_count,
             size / 1024 / 1024,
         )
         current_zip = None
         current_path = None
+        current_index = None
 
-    for i, meta in enumerate(metas):
-        photos = load_photos(meta, max_edge, quality, stats)
-        approx = len(meta.record_json_bytes) + sum(len(p.bytes) for p in photos)
-        if current_zip is None:
-            open_next()
-        elif (
-            current_bytes_estimate + approx > shard_size_bytes
-            and current_record_count > 0
-        ):
-            close_current()
-            open_next()
+    try:
+        for i, meta in enumerate(metas):
+            record_json_bytes = meta.record_path.read_bytes()
+            photos = load_photos(meta, max_edge, quality, stats)
+            approx = len(record_json_bytes) + sum(len(p.bytes) for p in photos)
+            if current_zip is None:
+                open_next()
+            elif (
+                current_bytes_estimate + approx > shard_size_bytes
+                and current_record_count > 0
+            ):
+                close_current()
+                open_next()
 
-        base = f"{state_code}/{meta.userdir_name}"
-        current_zip.writestr(f"{base}/record.json", meta.record_json_bytes)
-        for photo in photos:
-            current_zip.writestr(
-                f"{base}/photos/{photo.filename}", photo.bytes
-            )
-        current_bytes_estimate += approx
-        current_record_count += 1
-        # photos goes out of scope at next iteration — its byte
-        # payloads are released back to the allocator before the next
-        # user's photos are decoded.
-        if (i + 1) % 500 == 0:
-            logger.info(
-                "[%s] wrote %d / %d records", state_code, i + 1, len(metas)
-            )
-
-    close_current()
+            base = f"{state_code}/{meta.userdir_name}"
+            write_entry(f"{base}/record.json", record_json_bytes)
+            for photo in photos:
+                write_entry(f"{base}/photos/{photo.filename}", photo.bytes)
+            current_bytes_estimate += approx
+            current_record_count += 1
+            # photos goes out of scope at next iteration — its byte
+            # payloads are released back to the allocator before the next
+            # user's photos are decoded.
+            if (i + 1) % 500 == 0:
+                logger.info(
+                    "[%s] wrote %d / %d records", state_code, i + 1, len(metas)
+                )
+    except BaseException:
+        # Do not record a partially-written archive as a ShardInfo. Closing the
+        # handle is essential on Windows before the staging tree can be removed.
+        if current_zip is not None:
+            current_zip.close()
+        raise
+    else:
+        close_current()
     return shards
 
 
 def hash_file(path: Path) -> str:
-    """SHA-256 of file contents, streamed in 1 MB chunks so SD shards
-    don't blow up memory."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """Backwards-compatible wrapper for the shared streaming digest helper."""
+
+    return sha256_file(path)
 
 
 # ---------- shard verification -----------------------------------------
@@ -407,24 +490,28 @@ def process_state(
     quality: int,
     version: str,
     verify: bool,
+    allow_empty: bool = False,
 ) -> bool:
+    if not re.fullmatch(r"US-[A-Z]{2}", state_code):
+        logger.error("invalid state code %r; expected US-XX", state_code)
+        return False
     state_records = records_root / state_code
-    if not state_records.is_dir():
-        logger.warning(
-            "[%s] no records dir at %s — skipping", state_code, state_records
+    if state_records.is_symlink() or not state_records.is_dir():
+        logger.error(
+            "[%s] records dir missing or symlinked at %s — preserving prior bundle",
+            state_code,
+            state_records,
         )
-        return True
+        return False
 
     out_dir = out_root / state_code
-    if out_dir.exists():
-        # Wipe + rebuild. Sharding is deterministic given fixed input,
-        # but stale shards from a smaller prior run would otherwise
-        # sit alongside the new ones inside the same manifest dir.
-        logger.info("[%s] wiping existing output %s", state_code, out_dir)
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True)
+    if state_records.resolve() == out_dir.resolve():
+        logger.error("[%s] input and output state directories are identical", state_code)
+        return False
 
-    user_dirs = sorted(p for p in state_records.iterdir() if p.is_dir())
+    user_dirs = sorted(
+        p for p in state_records.iterdir() if p.is_dir() and not p.is_symlink()
+    )
     logger.info("[%s] scanning %d user dirs (pass 1: record.json only)",
                 state_code, len(user_dirs))
 
@@ -449,51 +536,94 @@ def process_state(
         state_code, len(metas),
     )
 
-    # Pass 2: stream into shards, loading photos JIT.
-    shards = write_shards(
-        state_code, metas, out_dir, shard_size_bytes, max_edge, quality, stats
-    )
+    if not metas and not allow_empty:
+        logger.error(
+            "[%s] no valid records found; preserving the last published bundle",
+            state_code,
+        )
+        return False
 
-    manifest = {
-        "stateCode": state_code,
-        "version": version,
-        "totalRecords": sum(s.record_count for s in shards),
-        "shards": [
-            {
-                "name": s.name,
-                "sizeBytes": s.size_bytes,
-                "sha256": s.sha256,
-                "recordCount": s.record_count,
-            }
-            for s in shards
-        ],
-    }
-    (out_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    out_root.mkdir(parents=True, exist_ok=True)
+    staged = Path(tempfile.mkdtemp(prefix=f".{state_code}.build-", dir=out_root))
+    published = False
+    try:
+        # Pass 2: stream into a private sibling directory.  The previously
+        # published bundle remains untouched until this one is complete.
+        shards = write_shards(
+            state_code, metas, staged, shard_size_bytes, max_edge, quality, stats
+        )
+        if not shards and not allow_empty:
+            logger.error(
+                "[%s] packaging produced no shards; preserving existing output",
+                state_code,
+            )
+            return False
 
-    verified = True
-    if verify:
-        logger.info("[%s] verifying %d shards", state_code, len(shards))
-        verified = verify_shards(out_dir, shards)
+        manifest = {
+            "stateCode": state_code,
+            "version": version,
+            "totalRecords": sum(s.record_count for s in shards),
+            "shards": [
+                {
+                    "name": s.name,
+                    "sizeBytes": s.size_bytes,
+                    "sha256": s.sha256,
+                    "recordCount": s.record_count,
+                }
+                for s in shards
+            ],
+        }
 
-    total_bytes = sum(s.size_bytes for s in shards)
-    logger.info(
-        "[%s] DONE — %d records, %d shards, %.1f MB total, "
-        "skipped(no-record=%d bad-json=%d missing-guid=%d) "
-        "photos(normalized=%d skipped=%d) verified=%s",
-        state_code,
-        manifest["totalRecords"],
-        len(shards),
-        total_bytes / 1024 / 1024,
-        stats.users_skipped_no_record,
-        stats.users_skipped_bad_json,
-        stats.users_missing_guid,
-        stats.photos_normalized,
-        stats.photos_skipped,
-        verified,
-    )
-    return verified
+        # Integrity is mandatory before publication.  ``--no-verify`` remains
+        # accepted for CLI compatibility but now only suppresses the progress
+        # message; publishing an unchecked replacement is never safe.
+        if verify:
+            logger.info("[%s] verifying %d shards", state_code, len(shards))
+        verified = verify_shards(staged, shards)
+        if not verified:
+            logger.error(
+                "[%s] verification failed; preserving the last published bundle",
+                state_code,
+            )
+            return False
+
+        # The manifest is the commit marker and is created only after every
+        # archive passes verification.  Validate our own serialized contract
+        # before exposing it to download/load consumers.
+        manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+        parse_manifest(
+            manifest_bytes,
+            expected_state=state_code,
+            require_nonempty=not allow_empty,
+        )
+        (staged / "manifest.json").write_bytes(manifest_bytes)
+
+        publish_directory(staged, out_dir)
+        published = True
+
+        total_bytes = sum(s.size_bytes for s in shards)
+        logger.info(
+            "[%s] DONE — %d records, %d shards, %.1f MB total, "
+            "skipped(no-record=%d bad-json=%d unsafe-path=%d wrong-state=%d "
+            "missing-guid=%d) "
+            "photos(normalized=%d skipped=%d) verified=%s",
+            state_code,
+            manifest["totalRecords"],
+            len(shards),
+            total_bytes / 1024 / 1024,
+            stats.users_skipped_no_record,
+            stats.users_skipped_bad_json,
+            stats.users_skipped_unsafe_path,
+            stats.users_skipped_wrong_state,
+            stats.users_missing_guid,
+            stats.photos_normalized,
+            stats.photos_skipped,
+            verified,
+        )
+        return True
+    finally:
+        if not published and staged.exists():
+            shutil.rmtree(staged)
 
 
 # ---------- main -------------------------------------------------------
@@ -545,7 +675,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--no-verify",
         action="store_true",
-        help="Skip the post-write zip-integrity sweep.",
+        help="Deprecated compatibility flag; integrity verification remains mandatory.",
+    )
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Explicitly publish an empty state manifest. By default an empty "
+        "input is treated as a failed build and the prior bundle is preserved.",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Set log level to DEBUG."
@@ -559,6 +695,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not args.records_dir.is_dir():
         parser.error(f"records dir not found: {args.records_dir}")
+    if args.records_dir.resolve() == args.shards_dir.resolve():
+        parser.error("--records-dir and --shards-dir must be different directories")
+    if args.shard_size_mb <= 0:
+        parser.error("--shard-size-mb must be greater than zero")
+    if args.max_edge <= 0:
+        parser.error("--max-edge must be greater than zero")
+    if not 1 <= args.jpeg_quality <= 95:
+        parser.error("--jpeg-quality must be between 1 and 95")
 
     if args.state:
         # Dedupe + preserve user-specified order.
@@ -571,6 +715,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     if not states:
         parser.error(f"no US-* state dirs under {args.records_dir}")
+    invalid_states = [state for state in states if not re.fullmatch(r"US-[A-Z]{2}", state)]
+    if invalid_states:
+        parser.error(
+            "invalid --state value(s): " + ", ".join(repr(s) for s in invalid_states)
+        )
 
     # Hard blacklist: drop these jurisdictions even when explicitly passed
     # via --state, so there's no way to package them by mistake.
@@ -615,6 +764,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 quality=args.jpeg_quality,
                 version=version,
                 verify=not args.no_verify,
+                allow_empty=args.allow_empty,
             )
             overall_ok = overall_ok and ok
         except KeyboardInterrupt:
