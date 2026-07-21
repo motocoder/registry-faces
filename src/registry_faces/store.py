@@ -21,6 +21,9 @@ from web_scrubber.store import StoreSpec
 from .schema import Address, Identity, Offense, OffenderRecord, Source
 
 
+_EARTH_RADIUS_METERS = 6_371_008.8
+
+
 # ---------------------------------------------------------------------------
 # Merge key functions (domain-specific)
 
@@ -142,11 +145,25 @@ class FileStore(_BaseStore):
         return out
 
     def search_radius(self, lat: float, lon: float, radius_meters: float) -> list:
-        lat_delta = radius_meters / 111_111
-        cos_lat = max(0.0001, abs(math.cos(math.radians(lat))))
-        lon_delta = radius_meters / (111_111 * cos_lat)
-        lat_lo, lat_hi = lat - lat_delta, lat + lat_delta
-        lon_lo, lon_hi = lon - lon_delta, lon + lon_delta
+        if not -90.0 <= lat <= 90.0:
+            raise ValueError("latitude must be between -90 and 90")
+        if radius_meters < 0:
+            raise ValueError("radius_meters cannot be negative")
+
+        # Use a cheap spherical bounding box only as a prefilter.  The old
+        # implementation returned the whole box, including points well outside
+        # the requested circle, and failed around the antimeridian.  Longitude
+        # is compared as a wrapped delta so +179/-179 remain neighbors.
+        angular = radius_meters / _EARTH_RADIUS_METERS
+        lat_rad = math.radians(lat)
+        lat_delta = math.degrees(angular)
+        lat_lo = max(-90.0, lat - lat_delta)
+        lat_hi = min(90.0, lat + lat_delta)
+        if angular >= (math.pi / 2) - abs(lat_rad):
+            lon_delta = 180.0
+        else:
+            ratio = math.sin(angular) / max(abs(math.cos(lat_rad)), 1e-15)
+            lon_delta = math.degrees(math.asin(min(1.0, abs(ratio))))
 
         out = []
         for entry in self._index.values():
@@ -154,7 +171,12 @@ class FileStore(_BaseStore):
                 a_lat, a_lon = addr.get("lat"), addr.get("lon")
                 if a_lat is None or a_lon is None:
                     continue
-                if lat_lo <= a_lat <= lat_hi and lon_lo <= a_lon <= lon_hi:
+                wrapped_lon_delta = abs(((a_lon - lon + 180.0) % 360.0) - 180.0)
+                if (
+                    lat_lo <= a_lat <= lat_hi
+                    and wrapped_lon_delta <= lon_delta
+                    and _haversine_meters(lat, lon, a_lat, a_lon) <= radius_meters
+                ):
                     rec = self.get(entry["jurisdiction"], entry["source_id"])
                     if rec is not None:
                         out.append(rec)
@@ -194,3 +216,16 @@ class FileStore(_BaseStore):
 
 # Backwards-compat alias
 Store = FileStore
+
+
+def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance with a wrapped longitude delta."""
+
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = math.radians(((lon2 - lon1 + 180.0) % 360.0) - 180.0)
+    hav = (
+        math.sin(dphi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    )
+    return 2.0 * _EARTH_RADIUS_METERS * math.asin(math.sqrt(min(1.0, hav)))

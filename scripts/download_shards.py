@@ -1,10 +1,11 @@
 """Download shard bundles from Cloudflare R2 to a local dir.
 
 The inverse of ``upload_shards.py``: pulls ``shards/US-XX/{manifest.json,
-shard-NNN.zip}`` out of the R2 bucket so they can be unpacked and re-published
+shard-*.zip}`` out of the R2 bucket so they can be unpacked and re-published
 (see ``load_shards_identity.py``) without re-scraping the live registries.
 
-* Skip-if-unchanged by byte size (same cheap test the uploader uses).
+* Treat each state's manifest as the authoritative inventory.
+* Verify every shard by byte size and SHA-256 before publishing it locally.
 * ``--state`` (repeatable) restricts to specific jurisdictions; default = all.
 * Skips non ``US-*`` keys (e.g. the ``TEST``/``TEST2`` scratch shards).
 
@@ -21,7 +22,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 try:
@@ -32,6 +36,13 @@ except ImportError:
     sys.exit(2)
 
 from dotenv import load_dotenv
+
+from registry_faces.shards import (
+    parse_manifest,
+    publish_directory,
+    sha256_file,
+    verified_shard_paths,
+)
 
 
 def _require_env(key: str) -> str:
@@ -58,6 +69,140 @@ def _client(endpoint: str, access: str, secret: str):
     )
 
 
+def _remote_manifest_states(client, bucket: str, prefix: str) -> set[str]:
+    """Return states that expose an authoritative ``manifest.json`` object."""
+
+    states: set[str] = set()
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj.get("Key", "")
+            if not key.startswith(prefix):
+                continue
+            rel = key[len(prefix):]
+            parts = rel.split("/")
+            if (
+                len(parts) == 2
+                and re.fullmatch(r"US-[A-Z]{2}", parts[0]) is not None
+                and parts[1] == "manifest.json"
+            ):
+                states.add(parts[0])
+    return states
+
+
+def _remote_manifest(client, bucket: str, prefix: str, state: str):
+    """Fetch and validate a state's remote commit marker."""
+
+    key = f"{prefix}{state}/manifest.json"
+    response = client.get_object(Bucket=bucket, Key=key)
+    payload = response["Body"].read()
+    manifest = parse_manifest(payload, expected_state=state)
+    return key, payload, manifest
+
+
+def _local_bundle_current(state_dir: Path, manifest_bytes: bytes) -> bool:
+    """True only when local manifest and exact local shard set are verified."""
+
+    manifest_path = state_dir / "manifest.json"
+    if not manifest_path.is_file() or manifest_path.read_bytes() != manifest_bytes:
+        return False
+    try:
+        paths = verified_shard_paths(state_dir)
+    except ValueError:
+        return False
+    expected = {path.name for path in paths}
+    actual = {path.name for path in state_dir.glob("shard-*.zip") if path.is_file()}
+    return actual == expected
+
+
+def _download_state(
+    client,
+    *,
+    bucket: str,
+    prefix: str,
+    state: str,
+    shards_dir: Path,
+    dry_run: bool,
+) -> tuple[int, int, int]:
+    """Stage and verify one complete state bundle, then publish it as a unit."""
+
+    _manifest_key, manifest_bytes, manifest = _remote_manifest(
+        client, bucket, prefix, state
+    )
+    state_dir = shards_dir / state
+    if _local_bundle_current(state_dir, manifest_bytes):
+        return 0, len(manifest.shards), 0
+
+    def local_shard_ok(entry) -> bool:
+        current = state_dir / entry.name
+        return bool(
+            not current.is_symlink()
+            and current.is_file()
+            and current.stat().st_size == entry.size_bytes
+            and sha256_file(current) == entry.sha256
+        )
+
+    # A dry-run may inspect remote/local state, but must not create its output
+    # root or a temporary staging directory.
+    if dry_run:
+        skipped = 0
+        for entry in manifest.shards:
+            if local_shard_ok(entry):
+                skipped += 1
+            else:
+                print(
+                    f"{state}/{entry.name} would download "
+                    f"({entry.size_bytes / 1024 / 1024:.1f} MB)"
+                )
+        return 0, skipped, 0
+
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    staged = Path(tempfile.mkdtemp(prefix=f".{state}.download-", dir=shards_dir))
+    published = False
+    downloaded = skipped = total_bytes = 0
+    try:
+        for entry in manifest.shards:
+            remote_key = f"{prefix}{state}/{entry.name}"
+            current = state_dir / entry.name
+            destination = staged / entry.name
+            current_ok = local_shard_ok(entry)
+            if current_ok:
+                skipped += 1
+                shutil.copy2(current, destination)
+                continue
+
+            client.download_file(bucket, remote_key, str(destination))
+            actual_size = destination.stat().st_size
+            if actual_size != entry.size_bytes:
+                raise ValueError(
+                    f"downloaded {remote_key} is {actual_size} bytes; "
+                    f"manifest expects {entry.size_bytes}"
+                )
+            actual_digest = sha256_file(destination)
+            if actual_digest != entry.sha256:
+                raise ValueError(
+                    f"downloaded {remote_key} sha256 is {actual_digest}; "
+                    f"manifest expects {entry.sha256}"
+                )
+            downloaded += 1
+            total_bytes += actual_size
+            print(
+                f"{state}/{entry.name} ({actual_size / 1024 / 1024:.1f} MB)",
+                flush=True,
+            )
+
+        (staged / "manifest.json").write_bytes(manifest_bytes)
+        # Re-read the staged contract before replacing the last known-good
+        # local bundle.  This also ensures copied shards were not altered.
+        verified_shard_paths(staged, expected_state=state)
+        publish_directory(staged, state_dir)
+        published = True
+        return downloaded, skipped, total_bytes
+    finally:
+        if not published and staged.exists():
+            shutil.rmtree(staged)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Download shards from R2.")
     parser.add_argument("--shards-dir", type=Path, default=Path("shards"),
@@ -75,57 +220,47 @@ def main(argv: list[str] | None = None) -> int:
     bucket, prefix = _split_bucket(args.bucket or _require_env("SHARDS_BUCKET"))
     want = {s.upper() for s in args.state} if args.state else None
 
-    # Gather remote objects, grouped by state (top path segment under prefix).
-    objects: list[tuple[str, str, int]] = []  # (key, state, size)
-    for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
-        for o in page.get("Contents", []):
-            rel = o["Key"][len(prefix):]
-            parts = rel.split("/")
-            if len(parts) < 2 or not parts[0]:
-                continue
-            state = parts[0]
-            if not state.startswith("US-"):  # skip TEST/TEST2 scratch shards
-                continue
-            if want and state not in want:
-                continue
-            objects.append((o["Key"], state, o["Size"]))
+    remote_states = _remote_manifest_states(client, bucket, prefix)
+    states = sorted(remote_states if want is None else remote_states & want)
+    missing = sorted((want or set()) - remote_states)
 
     if args.list:
-        by_state: dict[str, list[int]] = {}
-        for _key, state, size in objects:
-            by_state.setdefault(state, []).append(size)
-        print(f"bucket={bucket} prefix={prefix!r}  states={len(by_state)}")
-        for state in sorted(by_state):
-            sizes = by_state[state]
-            print(f"  {state}: {len(sizes)} objects, {sum(sizes)/1024/1024:.1f} MB")
-        return 0
+        print(f"bucket={bucket} prefix={prefix!r}  states={len(states)}")
+        for state in states:
+            print(f"  {state}")
+        if missing:
+            print(f"  missing requested manifests: {', '.join(missing)}")
+        return 1 if missing else 0
 
-    if not objects:
+    if not states:
         sys.stderr.write(f"no matching US-* shards in {bucket}/{prefix} "
                          f"{'for '+str(sorted(want)) if want else ''}\n")
         return 1
 
     downloaded = skipped = 0
     total_bytes = 0
-    for i, (key, _state, size) in enumerate(sorted(objects), 1):
-        rel = key[len(prefix):]
-        dest = args.shards_dir / rel
-        label = f"[{i}/{len(objects)}] {rel}"
-        if dest.exists() and dest.stat().st_size == size:
-            skipped += 1
+    failures = len(missing)
+    for state in states:
+        try:
+            got, kept, byte_count = _download_state(
+                client,
+                bucket=bucket,
+                prefix=prefix,
+                state=state,
+                shards_dir=args.shards_dir,
+                dry_run=args.dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate state publications
+            failures += 1
+            sys.stderr.write(f"{state}: download failed: {exc}\n")
             continue
-        if args.dry_run:
-            print(f"{label}  would download ({size/1024/1024:.1f} MB)")
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        client.download_file(bucket, key, str(dest))
-        downloaded += 1
-        total_bytes += size
-        print(f"{label}  ({size/1024/1024:.1f} MB)", flush=True)
+        downloaded += got
+        skipped += kept
+        total_bytes += byte_count
 
     print(f"\ndone: {downloaded} downloaded ({total_bytes/1024/1024:.1f} MB), "
           f"{skipped} already present -> {args.shards_dir.resolve()}")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

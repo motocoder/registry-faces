@@ -1,7 +1,7 @@
 """Upload shard bundles to Cloudflare R2 with skip-if-unchanged semantics.
 
 Python sibling of :mod:`scripts.package_shards`: where ``package_shards.py``
-*produces* ``shards/US-XX/{manifest.json, shard-NNN.zip}``, this script
+*produces* ``shards/US-XX/{manifest.json, shard-NNN-<sha256>.zip}``, this script
 *ships* them to the R2 bucket the registry-recognizer Android client reads
 from.
 
@@ -11,13 +11,11 @@ ShardUploader.java``):
 
 * Walks SHARDS_FOLDER recursively, treating each file's path relative to
   the folder root as the R2 object key under SHARDS_BUCKET.
-* HEAD per file: if R2 already has the object **with the same byte size**,
-  SKIP. Otherwise PUT. Size-match is the cheap "already uploaded" test;
-  it won't catch content changes that preserve byte size (uncommon for
-  zip archives, but possible for json manifests).
+* HEAD per shard: skip only when size and publisher SHA-256 metadata match.
+  Equal-size content changes are therefore uploaded correctly.
 * Additive — never deletes remote-only files.
-* Concurrent — ``--parallelism`` (default 8) per-file uploads via a thread
-  pool.
+* Shards upload concurrently, followed by each state manifest as the commit
+  marker.  A manifest is never published when any shard upload fails.
 
 Usage::
 
@@ -31,7 +29,7 @@ Usage::
 Credentials and bucket come from .env (loaded via python-dotenv). See
 .env.example for the required keys.
 
-Exit code: number of files that failed to upload. Zero on full success.
+Exit code: zero on full success, one when any upload fails.
 """
 
 from __future__ import annotations
@@ -41,6 +39,7 @@ import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -55,6 +54,14 @@ except ImportError:
     sys.exit(2)
 
 from dotenv import load_dotenv
+
+from registry_faces.blacklist import BLACKLIST
+from registry_faces.shards import (
+    is_content_addressed_shard_name,
+    load_local_manifest,
+    sha256_file,
+    verified_shard_paths,
+)
 
 
 logger = logging.getLogger("upload_shards")
@@ -113,18 +120,75 @@ def _walk_files(root: Path) -> list[Path]:
     )
 
 
-def _head_size(client, bucket: str, key: str) -> int | None:
-    """Return remote object size, or None if absent / inaccessible."""
+def _head_info(client, bucket: str, key: str) -> tuple[int | None, str | None]:
+    """Return remote object size and publisher SHA-256, or absence markers."""
+
     try:
         resp = client.head_object(Bucket=bucket, Key=key)
-        return int(resp["ContentLength"])
+        metadata = resp.get("Metadata") or {}
+        digest = metadata.get("sha256")
+        return int(resp["ContentLength"]), digest.lower() if digest else None
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         # 404 → object absent (expected for new uploads). Anything else is
         # a real problem the caller should know about.
         if code in {"404", "NoSuchKey", "NotFound"}:
-            return None
+            return None, None
         raise
+
+
+@dataclass(frozen=True)
+class UploadItem:
+    path: Path
+    rel: str
+    sha256: str
+    is_manifest: bool = False
+
+
+def _publication_items(root: Path) -> tuple[list[UploadItem], list[UploadItem]]:
+    """Collect only verified, manifest-listed state bundles.
+
+    Stale local ``shard-*.zip`` files are intentionally ignored.  The manifest
+    is the sole publication inventory and is returned in a second list so the
+    caller can upload it only after all data objects succeed.
+    """
+
+    shards: list[UploadItem] = []
+    manifests: list[UploadItem] = []
+    for state_dir in sorted(
+        path for path in root.iterdir() if path.is_dir() and path.name.startswith("US-")
+    ):
+        if state_dir.name in BLACKLIST:
+            raise ValueError(
+                f"{state_dir.name} is blacklisted ({BLACKLIST[state_dir.name]})"
+            )
+        manifest = load_local_manifest(state_dir)
+        paths = verified_shard_paths(state_dir)
+        for entry, path in zip(manifest.shards, paths, strict=True):
+            if not is_content_addressed_shard_name(entry.name, entry.sha256):
+                raise ValueError(
+                    f"{state_dir.name}/{entry.name} uses a mutable legacy name; "
+                    "re-run package_shards.py before uploading"
+                )
+            shards.append(
+                UploadItem(
+                    path=path,
+                    rel=path.relative_to(root).as_posix(),
+                    sha256=entry.sha256,
+                )
+            )
+        manifest_path = state_dir / "manifest.json"
+        manifests.append(
+            UploadItem(
+                path=manifest_path,
+                rel=manifest_path.relative_to(root).as_posix(),
+                sha256=sha256_file(manifest_path),
+                is_manifest=True,
+            )
+        )
+    if not manifests:
+        raise ValueError(f"no valid US-* manifests under {root}")
+    return shards, manifests
 
 
 def _upload_one(
@@ -136,15 +200,25 @@ def _upload_one(
     idx: int,
     total: int,
     dry_run: bool,
+    *,
+    checksum: str | None = None,
+    force: bool = False,
 ) -> tuple[bool, str]:
     """Upload one file. Returns (success, status_line). Status line mirrors
     the Java ShardUploader output for grep-friendly logs."""
     key = prefix + rel
     label = f"[{idx}/{total}] {rel:40s}"
     size = local_file.stat().st_size
+    checksum = checksum or sha256_file(local_file)
     try:
-        remote_size = _head_size(client, bucket, key)
-        if remote_size == size:
+        actual_checksum = sha256_file(local_file)
+        if actual_checksum != checksum:
+            return False, (
+                f"{label} local file changed after inventory "
+                f"({actual_checksum} != {checksum})"
+            )
+        remote_size, remote_checksum = _head_info(client, bucket, key)
+        if not force and remote_size == size and remote_checksum == checksum:
             return True, f"{label} unchanged                SKIP"
         if dry_run:
             return True, f"{label} would upload ({size} bytes)  DRY-RUN"
@@ -152,8 +226,18 @@ def _upload_one(
             str(local_file),
             bucket,
             key,
-            ExtraArgs={"ContentType": _content_type(local_file.name)},
+            ExtraArgs={
+                "ContentType": _content_type(local_file.name),
+                "Metadata": {"sha256": checksum},
+            },
         )
+        final_size = local_file.stat().st_size
+        final_checksum = sha256_file(local_file)
+        if final_size != size or final_checksum != checksum:
+            # The immutable key is still uncommitted because manifests are a
+            # later phase.  Fail closed so this potentially inconsistent object
+            # is never referenced; a retry can safely repair the same key.
+            return False, f"{label} local file changed during upload"
         return True, f"{label} uploaded ({size} bytes) OK"
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "?")
@@ -172,6 +256,98 @@ def _content_type(name: str) -> str:
     if n.endswith(".jpg") or n.endswith(".jpeg"):
         return "image/jpeg"
     return "application/octet-stream"
+
+
+def _upload_phase(
+    *,
+    client,
+    bucket: str,
+    prefix: str,
+    items: list[UploadItem],
+    parallelism: int,
+    dry_run: bool,
+    start_index: int,
+    total: int,
+    force: bool = False,
+) -> tuple[int, int, int]:
+    """Upload one dependency-ordered phase and return uploaded/skipped/failed."""
+
+    uploaded = skipped = failed = 0
+    if not items:
+        return uploaded, skipped, failed
+    with ThreadPoolExecutor(max_workers=parallelism) as pool:
+        futures = {
+            pool.submit(
+                _upload_one,
+                client,
+                bucket,
+                prefix,
+                item.path,
+                item.rel,
+                start_index + offset,
+                total,
+                dry_run,
+                checksum=item.sha256,
+                force=force,
+            ): item
+            for offset, item in enumerate(items)
+        }
+        for future in as_completed(futures):
+            ok, line = future.result()
+            print(line)
+            if not ok:
+                failed += 1
+            elif "SKIP" in line:
+                skipped += 1
+            else:
+                uploaded += 1
+    return uploaded, skipped, failed
+
+
+def _publish_inventory(
+    *,
+    client,
+    bucket: str,
+    prefix: str,
+    shard_items: list[UploadItem],
+    manifest_items: list[UploadItem],
+    parallelism: int,
+    dry_run: bool,
+) -> tuple[int, int, int]:
+    """Publish data first and manifests only after a fully successful phase."""
+
+    total = len(shard_items) + len(manifest_items)
+    uploaded, skipped, failed = _upload_phase(
+        client=client,
+        bucket=bucket,
+        prefix=prefix,
+        items=shard_items,
+        parallelism=parallelism,
+        dry_run=dry_run,
+        start_index=1,
+        total=total,
+    )
+    if failed:
+        for item in manifest_items:
+            print(f"WITHHELD {item.rel}: one or more shard uploads failed")
+        return uploaded, skipped, failed + len(manifest_items)
+
+    manifest_uploaded, manifest_skipped, manifest_failed = _upload_phase(
+        client=client,
+        bucket=bucket,
+        prefix=prefix,
+        items=manifest_items,
+        parallelism=parallelism,
+        dry_run=dry_run,
+        start_index=len(shard_items) + 1,
+        total=total,
+        force=True,
+    )
+    return (
+        uploaded + manifest_uploaded,
+        skipped + manifest_skipped,
+        failed + manifest_failed,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -203,6 +379,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.parallelism < 1:
+        parser.error("--parallelism must be at least 1")
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(message)s",
@@ -233,7 +412,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     client = _build_client(endpoint, access, secret)
-    files = _walk_files(shards_dir)
+    try:
+        shard_items, manifest_items = _publication_items(shards_dir)
+    except ValueError as exc:
+        sys.stderr.write(f"refusing to upload invalid shard inventory: {exc}\n")
+        return 2
 
     print("upload_shards.py:")
     print(f"  SHARDS_FOLDER = {shards_dir.resolve()}")
@@ -243,42 +426,28 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  parallelism   = {args.parallelism}")
     if args.dry_run:
         print("  DRY RUN (no PUTs will be sent)")
-    print(f"walking shards folder → {len(files)} files")
+    total = len(shard_items) + len(manifest_items)
+    print(
+        f"verified shard inventory → {len(shard_items)} shards, "
+        f"{len(manifest_items)} manifests"
+    )
 
-    uploaded = skipped = failed = 0
-    total = len(files)
-
-    with ThreadPoolExecutor(max_workers=args.parallelism) as pool:
-        futures = {
-            pool.submit(
-                _upload_one,
-                client,
-                bucket,
-                prefix,
-                f,
-                f.relative_to(shards_dir).as_posix(),
-                i + 1,
-                total,
-                args.dry_run,
-            ): f
-            for i, f in enumerate(files)
-        }
-        for fut in as_completed(futures):
-            ok, line = fut.result()
-            print(line)
-            if not ok:
-                failed += 1
-            elif "SKIP" in line:
-                skipped += 1
-            else:
-                uploaded += 1
+    uploaded, skipped, failed = _publish_inventory(
+        client=client,
+        bucket=bucket,
+        prefix=prefix,
+        shard_items=shard_items,
+        manifest_items=manifest_items,
+        parallelism=args.parallelism,
+        dry_run=args.dry_run,
+    )
 
     print()
     print(
         f"summary: {total} total, {uploaded} uploaded, {skipped} skipped, "
         f"{failed} failed"
     )
-    return failed
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
